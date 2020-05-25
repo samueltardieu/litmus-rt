@@ -180,8 +180,14 @@ static struct task_struct* gres_schedule(struct task_struct * prev)
 
 	raw_spin_lock(&state->lock);
 
-	BUG_ON(state->scheduled && state->scheduled != prev);
-	BUG_ON(state->scheduled && !is_realtime(prev));
+	if (state->scheduled && state->scheduled != prev)
+	{
+		TRACE_TASK(state->scheduled, "scheduled != prev, scheduled on cpu: %d\n", state->cpu);
+		TRACE_TASK(prev, "scheduled != prev, prev on cpu: %d\n", get_gres_state(prev)->cpu[0]);
+	}
+
+//	BUG_ON(state->scheduled && state->scheduled != prev);
+//	BUG_ON(state->scheduled && !is_realtime(prev));
 
 	/* update time */
 	state->sup_env.will_schedule = true;
@@ -277,6 +283,8 @@ static long gres_admit_task(struct task_struct *tsk)
 	struct table_driven_reservation *tdres;
 	lt_t first_start = ULLONG_MAX;
 	lt_t start;
+
+	TRACE_TASK(tsk, "ADMIT TASK\n");
 
 	if (!tinfo)
 		return -ENOMEM;
@@ -609,7 +617,7 @@ static long gres_deactivate_plugin(void)
 }
 
 static struct sched_plugin gres_plugin = {
-	.plugin_name		= "P-RES",
+	.plugin_name		= "G-RES",
 	.schedule		= gres_schedule,
 	.task_block		= gres_task_block,
 	.task_wake_up		= gres_task_resume,
