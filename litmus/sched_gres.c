@@ -364,8 +364,8 @@ static void gres_task_new(struct task_struct *tsk, int on_runqueue,
 			  int is_running)
 {
 	unsigned long flags;
-	struct gres_task_state* tinfo = get_gres_state(tsk);
-	struct gres_cpu_state *state = cpu_state_for(tinfo->cpu[tinfo->curr_res]);
+//	struct gres_task_state* tinfo = get_gres_state(tsk);
+	struct gres_cpu_state *state = local_cpu_state();
 
 	TRACE_TASK(tsk, "new RT task %llu (on_rq:%d, running:%d)\n",
 		   litmus_clock(), on_runqueue, is_running);
