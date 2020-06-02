@@ -17,13 +17,17 @@
 #include <litmus/reservations/alloc.h>
 #include <litmus/reservations/table-driven.h>
 
+struct reservation_list {
+	struct list_head list;
+	struct reservation *res;
+	int cpu;
+};
+
 struct gres_task_state {
 	struct reservation_client *client;
-	int cpu[4];
 	struct task_client res_info;
-	struct reservation *res[4];
-	int nb_res;
-	int curr_res;
+	struct list_head res_list;
+	int curr_cpu;
 };
 
 struct gres_cpu_state {
@@ -229,7 +233,7 @@ static void gres_task_block(struct task_struct *tsk)
 {
 	unsigned long flags;
 	struct gres_task_state* tinfo = get_gres_state(tsk);
-	struct gres_cpu_state *state = cpu_state_for(tinfo->cpu[tinfo->curr_res]);
+	struct gres_cpu_state *state = cpu_state_for(tinfo->curr_cpu);
 
 	TRACE_TASK(tsk, "thread suspends at %llu (state:%d, running:%d)\n",
 		litmus_clock(), tsk->state, is_current_running());
@@ -248,13 +252,13 @@ static void gres_task_resume(struct task_struct  *tsk)
 {
 	unsigned long flags;
 	struct gres_task_state* tinfo = get_gres_state(tsk);
-	struct gres_cpu_state *state = cpu_state_for(tinfo->cpu[tinfo->curr_res]);
+	struct gres_cpu_state *state = cpu_state_for(tinfo->curr_cpu);
 
 	TRACE_TASK(tsk, "thread wakes up at %llu\n", litmus_clock());
 
 	raw_spin_lock_irqsave(&state->lock, flags);
 	/* Assumption: litmus_clock() is synchronized across cores,
-	 * since we might not actually be executing on tinfo->cpu[tinfo->curr_res]
+	 * since we might not actually be executing on tinfo->curr_cpu
 	 * at the moment. */
 	sup_update_time(&state->sup_env, litmus_clock());
 	task_arrives(tsk);
@@ -270,11 +274,12 @@ static long gres_admit_task(struct task_struct *tsk)
 	long err = -EINVAL;
 	unsigned long flags;
 	struct reservation *res;
+	struct reservation *first_res;
+	struct reservation_list *new_res = NULL;
+	struct table_driven_reservation *tdres;
 	struct gres_cpu_state *state;
 	struct gres_task_state *tinfo = kzalloc(sizeof(*tinfo), GFP_ATOMIC);
 	int cpu;
-	int i = 0;
-	struct table_driven_reservation *tdres;
 	lt_t first_start = ULLONG_MAX;
 	lt_t start;
 
@@ -297,6 +302,8 @@ static long gres_admit_task(struct task_struct *tsk)
 	TRACE_TASK(tsk, "on CPU %d, valid?:%d\n",
 		task_cpu(tsk), cpumask_test_cpu(task_cpu(tsk), &tsk->cpus_allowed));
 
+	tinfo->curr_cpu = task_cpu(tsk);
+	INIT_LIST_HEAD(&tinfo->res_list);
 
 	for_each_online_cpu(cpu) {
 		state = cpu_state_for(cpu);
@@ -306,27 +313,27 @@ static long gres_admit_task(struct task_struct *tsk)
 
 		/* found the appropriate reservation (or vCPU) */
 		if (res) {
-			tinfo->cpu[i] = cpu;
-			tinfo->res[i] = res;
+			new_res = kzalloc(sizeof(*new_res), GFP_ATOMIC);
+			new_res->res = res;
+			new_res->cpu = cpu;
+			list_add(&new_res->list, &tinfo->res_list);
 			err = 0;
 
 			tdres = container_of(res, struct table_driven_reservation, res);
 			start = tdres->intervals[tdres->next_interval].start;
 			if (start < first_start) {
-				tinfo->curr_res = i;
+				first_res = res;
 				first_start = start;
 			}
-			i++;
 		}
 		raw_spin_unlock_irqrestore(&state->lock, flags);
 	}
-	tinfo->nb_res = i;
 
-	if (tinfo->nb_res != 0) {
-		state = cpu_state_for(tinfo->cpu[tinfo->curr_res]);
+	if (!err) {
+		state = cpu_state_for(tinfo->curr_cpu);
 		raw_spin_lock_irqsave(&state->lock, flags);
-		res = tinfo->res[tinfo->curr_res];
-		task_client_init(&tinfo->res_info, tsk, res);
+
+		task_client_init(&tinfo->res_info, tsk, first_res);
 		tinfo->client = &tinfo->res_info.client;
 		tsk_rt(tsk)->plugin_state = tinfo;
 
@@ -356,8 +363,8 @@ static void gres_task_new(struct task_struct *tsk, int on_runqueue,
 			  int is_running)
 {
 	unsigned long flags;
-//	struct gres_task_state* tinfo = get_gres_state(tsk);
-	struct gres_cpu_state *state = local_cpu_state();
+	struct gres_task_state* tinfo = get_gres_state(tsk);
+	struct gres_cpu_state *state = cpu_state_for(tinfo->curr_cpu);
 
 	TRACE_TASK(tsk, "new RT task %llu (on_rq:%d, running:%d)\n",
 		   litmus_clock(), on_runqueue, is_running);
@@ -405,7 +412,8 @@ static void gres_task_exit(struct task_struct *tsk)
 {
 	unsigned long flags;
 	struct gres_task_state* tinfo = get_gres_state(tsk);
-	struct gres_cpu_state *state = cpu_state_for(tinfo->cpu[tinfo->curr_res]);
+	struct gres_cpu_state *state = cpu_state_for(tinfo->curr_cpu);
+	struct reservation_list *rlist;
 
 	raw_spin_lock_irqsave(&state->lock, flags);
 
@@ -427,6 +435,12 @@ static void gres_task_exit(struct task_struct *tsk)
 	} else
 		raw_spin_unlock_irqrestore(&state->lock, flags);
 
+	while (!list_empty(&tinfo->res_list)) {
+		rlist = list_first_entry(&tinfo->res_list, struct reservation_list, list);
+		list_del(&rlist->list);
+		kfree(rlist);
+	}
+
 	kfree(tsk_rt(tsk)->plugin_state);
 	tsk_rt(tsk)->plugin_state = NULL;
 }
@@ -440,7 +454,7 @@ static void gres_current_budget(lt_t *used_so_far, lt_t *remaining)
 
 	local_irq_disable();
 
-	state = cpu_state_for(tstate->cpu[tstate->curr_res]);
+	state = cpu_state_for(tstate->curr_cpu);
 
 	raw_spin_lock(&state->lock);
 
