@@ -20,12 +20,12 @@
 struct reservation_list {
 	struct list_head list;
 	struct reservation *res;
+	struct reservation_client *client;
+	struct task_client res_info;
 	int cpu;
 };
 
 struct gres_task_state {
-	struct reservation_client *client;
-	struct task_client res_info;
 	struct list_head res_list;
 	int curr_cpu;
 };
@@ -55,12 +55,15 @@ static void task_departs(struct task_struct *tsk, int job_complete)
 	struct gres_task_state* state = get_gres_state(tsk);
 	struct reservation* res;
 	struct reservation_client *client;
+	struct reservation_list *rlist;
 
-	client = state->client;
-	res    = client->reservation;
+	list_for_each_entry(rlist, &state->res_list, list) {
+		client = rlist->client;
+		res    = client->reservation;
 
-	res->ops->client_departs(res, client, job_complete);
-	TRACE_TASK(tsk, "client_departs: removed from reservation R%d\n", res->id);
+		res->ops->client_departs(res, client, job_complete);
+		TRACE_TASK(tsk, "client_departs: removed from reservation R%d\n", res->id);
+	}
 }
 
 static void task_arrives(struct task_struct *tsk)
@@ -68,12 +71,15 @@ static void task_arrives(struct task_struct *tsk)
 	struct gres_task_state* state = get_gres_state(tsk);
 	struct reservation* res;
 	struct reservation_client *client;
+	struct reservation_list *rlist;
 
-	client = state->client;
-	res    = client->reservation;
+	list_for_each_entry(rlist, &state->res_list, list) {
+		client = rlist->client;
+		res    = client->reservation;
 
-	res->ops->client_arrives(res, client);
-	TRACE_TASK(tsk, "client_arrives: added to reservation R%d\n", res->id);
+		res->ops->client_arrives(res, client);
+		TRACE_TASK(tsk, "client_arrives: added to reservation R%d\n", res->id);
+	}
 }
 
 /* NOTE: drops state->lock */
@@ -278,14 +284,10 @@ static long gres_admit_task(struct task_struct *tsk)
 	long err = -EINVAL;
 	unsigned long flags;
 	struct reservation *res;
-	struct reservation *first_res;
 	struct reservation_list *new_res = NULL;
-	struct table_driven_reservation *tdres;
 	struct gres_cpu_state *state;
 	struct gres_task_state *tinfo = kzalloc(sizeof(*tinfo), GFP_ATOMIC);
 	int cpu;
-	lt_t first_start = ULLONG_MAX;
-	lt_t start;
 
 	if (!tinfo)
 		return -ENOMEM;
@@ -320,15 +322,10 @@ static long gres_admit_task(struct task_struct *tsk)
 			new_res = kzalloc(sizeof(*new_res), GFP_ATOMIC);
 			new_res->res = res;
 			new_res->cpu = cpu;
+			task_client_init(&new_res->res_info, tsk, res);
+			new_res->client = &new_res->res_info.client;
 			list_add(&new_res->list, &tinfo->res_list);
 			err = 0;
-
-			tdres = container_of(res, struct table_driven_reservation, res);
-			start = tdres->intervals[tdres->next_interval].start;
-			if (start < first_start) {
-				first_res = res;
-				first_start = start;
-			}
 		}
 		raw_spin_unlock_irqrestore(&state->lock, flags);
 	}
@@ -337,8 +334,6 @@ static long gres_admit_task(struct task_struct *tsk)
 		state = cpu_state_for(tinfo->curr_cpu);
 		raw_spin_lock_irqsave(&state->lock, flags);
 
-		task_client_init(&tinfo->res_info, tsk, first_res);
-		tinfo->client = &tinfo->res_info.client;
 		tsk_rt(tsk)->plugin_state = tinfo;
 
 		/* disable LITMUS^RT's per-thread budget enforcement */
@@ -453,6 +448,8 @@ static void gres_current_budget(lt_t *used_so_far, lt_t *remaining)
 {
 	struct gres_task_state *tstate = get_gres_state(current);
 	struct gres_cpu_state *state;
+	struct reservation_list *rlist;
+	struct reservation *res = NULL;
 
 	/* FIXME: protect against concurrent task_exit() */
 
@@ -463,10 +460,14 @@ static void gres_current_budget(lt_t *used_so_far, lt_t *remaining)
 	raw_spin_lock(&state->lock);
 
 	sup_update_time(&state->sup_env, litmus_clock());
+	list_for_each_entry(rlist, &tstate->res_list, list) {
+		if (rlist->cpu == state->cpu)
+			res = rlist->res;
+	}
 	if (remaining)
-		*remaining = tstate->client->reservation->cur_budget;
+		*remaining = res->cur_budget;
 	if (used_so_far)
-		*used_so_far = tstate->client->reservation->budget_consumed;
+		*used_so_far = res->budget_consumed;
 	gres_update_timer_and_unlock(state);
 
 	local_irq_enable();
