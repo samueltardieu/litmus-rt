@@ -181,6 +181,7 @@ static struct task_struct* gres_schedule(struct task_struct * prev)
 {
 	/* next == NULL means "schedule background work". */
 	struct gres_cpu_state *state = local_cpu_state();
+	struct gres_task_state *tinfo;
 
 	raw_spin_lock(&state->lock);
 
@@ -204,8 +205,11 @@ static struct task_struct* gres_schedule(struct task_struct * prev)
 
 	if (prev != state->scheduled && is_realtime(prev))
 		TRACE_TASK(prev, "descheduled.\n");
-	if (state->scheduled)
+	if (state->scheduled) {
+		tinfo = get_gres_state(state->scheduled);
+		tinfo->curr_cpu = state->cpu;
 		TRACE_TASK(state->scheduled, "scheduled.\n");
+	}
 
 	return state->scheduled;
 }
