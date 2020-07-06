@@ -28,6 +28,7 @@ struct reservation_list {
 struct gres_task_state {
 	struct list_head res_list;
 	int curr_cpu;
+	struct hrtimer budget_timer;
 };
 
 struct gres_cpu_state {
@@ -183,11 +184,19 @@ static enum hrtimer_restart on_scheduling_timer(struct hrtimer *timer)
 	return restart;
 }
 
+static enum hrtimer_restart on_budget_overrun(struct hrtimer *timer)
+{
+	TRACE("budget overrun!\n");
+	litmus_reschedule_local();
+	return HRTIMER_NORESTART;
+}
+
 static struct task_struct* gres_schedule(struct task_struct * prev)
 {
 	/* next == NULL means "schedule background work". */
 	struct gres_cpu_state *state = local_cpu_state();
 	struct gres_task_state *tinfo;
+	lt_t when_to_fire;
 
 	raw_spin_lock(&state->lock);
 
@@ -209,12 +218,18 @@ static struct task_struct* gres_schedule(struct task_struct * prev)
 	/* NOTE: drops state->lock */
 	gres_update_timer_and_unlock(state);
 
-	if (prev != state->scheduled && is_realtime(prev))
+	if (prev != state->scheduled && is_realtime(prev)) {
 		TRACE_TASK(prev, "descheduled.\n");
+		tinfo = get_gres_state(prev);
+		hrtimer_try_to_cancel(&tinfo->budget_timer);
+	}
 	if (state->scheduled) {
+		TRACE_TASK(state->scheduled, "scheduled.\n");
 		tinfo = get_gres_state(state->scheduled);
 		tinfo->curr_cpu = state->cpu;
-		TRACE_TASK(state->scheduled, "scheduled.\n");
+		when_to_fire = litmus_clock() + budget_remaining(state->scheduled);
+		hrtimer_start(&tinfo->budget_timer, ns_to_ktime(when_to_fire),
+				HRTIMER_MODE_ABS);
 	}
 
 	return state->scheduled;
@@ -309,6 +324,8 @@ static long gres_admit_task(struct task_struct *tsk)
 		task_cpu(tsk), cpumask_test_cpu(task_cpu(tsk), &tsk->cpus_allowed));
 
 	tinfo->curr_cpu = task_cpu(tsk);
+	hrtimer_init(&tinfo->budget_timer, CLOCK_MONOTONIC, HRTIMER_MODE_ABS);
+	tinfo->budget_timer.function = on_budget_overrun;
 	INIT_LIST_HEAD(&tinfo->res_list);
 
 	for_each_online_cpu(cpu) {
@@ -418,6 +435,8 @@ static void gres_task_exit(struct task_struct *tsk)
 
 	TRACE_TASK(tsk, "task exits at %llu (present:%d sched:%d)\n",
 		litmus_clock(), is_present(tsk), state->scheduled == tsk);
+
+	hrtimer_cancel(&tinfo->budget_timer);
 
 	if (state->scheduled == tsk)
 		state->scheduled = NULL;
