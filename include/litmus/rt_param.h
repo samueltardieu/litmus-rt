@@ -122,6 +122,8 @@ struct rt_task {
 	task_class_t	cls;
 	budget_policy_t  budget_policy;  /* ignored by pfair */
 	release_policy_t release_policy;
+	lt_t		hi_exec_cost;
+	unsigned int	hi_res_id;
 };
 
 /* don't export internal data structures to user space (liblitmus) */

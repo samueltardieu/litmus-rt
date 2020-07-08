@@ -26,7 +26,10 @@ struct reservation_list {
 };
 
 struct gres_task_state {
+	struct task_struct *tsk;
 	struct list_head res_list;
+	lt_t hi_exec_cost;
+	struct list_head hi_res_list;
 	int curr_cpu;
 	struct hrtimer budget_timer;
 };
@@ -40,6 +43,8 @@ struct gres_cpu_state {
 	int cpu;
 	struct task_struct* scheduled;
 };
+
+int hi_mode = 0;
 
 static DEFINE_PER_CPU(struct gres_cpu_state, gres_cpu_state);
 
@@ -56,9 +61,13 @@ static void task_departs(struct task_struct *tsk, int job_complete)
 	struct gres_task_state* state = get_gres_state(tsk);
 	struct reservation* res;
 	struct reservation_client *client;
+	struct list_head *list_to_use = &state->res_list;
 	struct reservation_list *rlist;
 
-	list_for_each_entry(rlist, &state->res_list, list) {
+	if (hi_mode && state->hi_exec_cost)
+		list_to_use = &state->hi_res_list;
+
+	list_for_each_entry(rlist, list_to_use, list) {
 		client = rlist->client;
 		res    = client->reservation;
 
@@ -72,7 +81,11 @@ static void task_arrives(struct task_struct *tsk)
 	struct gres_task_state* state = get_gres_state(tsk);
 	struct reservation* res;
 	struct reservation_client *client;
+	struct list_head *list_to_use = &state->res_list;
 	struct reservation_list *rlist;
+
+	if (hi_mode && state->hi_exec_cost)
+		list_to_use = &state->hi_res_list;
 
 	list_for_each_entry(rlist, &state->res_list, list) {
 		client = rlist->client;
@@ -186,7 +199,17 @@ static enum hrtimer_restart on_scheduling_timer(struct hrtimer *timer)
 
 static enum hrtimer_restart on_budget_overrun(struct hrtimer *timer)
 {
+	struct gres_task_state *tinfo;
+
 	TRACE("budget overrun!\n");
+
+	tinfo = container_of(timer, struct gres_task_state, budget_timer);
+	tsk_rt(tinfo->tsk)->task_params.exec_cost = tinfo->hi_exec_cost;
+	if (tinfo->hi_exec_cost)
+		task_departs(tinfo->tsk, 0);
+	hi_mode = 1;
+	if (tinfo->hi_exec_cost)
+		task_arrives(tinfo->tsk);
 	litmus_reschedule_local();
 	return HRTIMER_NORESTART;
 }
@@ -227,9 +250,11 @@ static struct task_struct* gres_schedule(struct task_struct * prev)
 		TRACE_TASK(state->scheduled, "scheduled.\n");
 		tinfo = get_gres_state(state->scheduled);
 		tinfo->curr_cpu = state->cpu;
-		when_to_fire = litmus_clock() + budget_remaining(state->scheduled);
-		hrtimer_start(&tinfo->budget_timer, ns_to_ktime(when_to_fire),
-				HRTIMER_MODE_ABS);
+		if (!hi_mode) {
+			when_to_fire = litmus_clock() + budget_remaining(state->scheduled);
+			hrtimer_start(&tinfo->budget_timer, ns_to_ktime(when_to_fire),
+					HRTIMER_MODE_ABS);
+		}
 	}
 
 	return state->scheduled;
@@ -323,10 +348,14 @@ static long gres_admit_task(struct task_struct *tsk)
 	TRACE_TASK(tsk, "on CPU %d, valid?:%d\n",
 		task_cpu(tsk), cpumask_test_cpu(task_cpu(tsk), &tsk->cpus_allowed));
 
+	tinfo->tsk = tsk;
 	tinfo->curr_cpu = task_cpu(tsk);
 	hrtimer_init(&tinfo->budget_timer, CLOCK_MONOTONIC, HRTIMER_MODE_ABS);
 	tinfo->budget_timer.function = on_budget_overrun;
 	INIT_LIST_HEAD(&tinfo->res_list);
+	tinfo->hi_exec_cost = tsk_rt(tsk)->task_params.hi_exec_cost;
+	if (tinfo->hi_exec_cost)
+		INIT_LIST_HEAD(&tinfo->hi_res_list);
 
 	for_each_online_cpu(cpu) {
 		state = cpu_state_for(cpu);
@@ -344,6 +373,20 @@ static long gres_admit_task(struct task_struct *tsk)
 			list_add(&new_res->list, &tinfo->res_list);
 			err = 0;
 		}
+
+		if (tinfo->hi_exec_cost) {
+			res = sup_find_by_id(&state->sup_env,
+					tsk_rt(tsk)->task_params.hi_res_id);
+			if (res) {
+				new_res = kzalloc(sizeof(*new_res), GFP_ATOMIC);
+				new_res->res = res;
+				new_res->cpu = cpu;
+				task_client_init(&new_res->res_info, tsk, res);
+				new_res->client = &new_res->res_info.client;
+				list_add(&new_res->list, &tinfo->hi_res_list);
+			}
+		}
+
 		raw_spin_unlock_irqrestore(&state->lock, flags);
 	}
 
@@ -457,6 +500,15 @@ static void gres_task_exit(struct task_struct *tsk)
 		rlist = list_first_entry(&tinfo->res_list, struct reservation_list, list);
 		list_del(&rlist->list);
 		kfree(rlist);
+	}
+
+	if (tinfo->hi_exec_cost) {
+		while (!list_empty(&tinfo->hi_res_list)) {
+			rlist = list_first_entry(&tinfo->hi_res_list,
+					struct reservation_list, list);
+			list_del(&rlist->list);
+			kfree(rlist);
+		}
 	}
 
 	kfree(tsk_rt(tsk)->plugin_state);
@@ -594,6 +646,8 @@ static long gres_activate_plugin(void)
 	int cpu;
 	struct gres_cpu_state *state;
 
+	hi_mode = 0;
+
 	for_each_online_cpu(cpu) {
 		TRACE("Initializing CPU%d...\n", cpu);
 
@@ -619,6 +673,8 @@ static long gres_deactivate_plugin(void)
 	int cpu;
 	struct gres_cpu_state *state;
 	struct reservation *res;
+
+	hi_mode = 0;
 
 	for_each_online_cpu(cpu) {
 		state = cpu_state_for(cpu);
