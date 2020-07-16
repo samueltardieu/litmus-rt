@@ -27,6 +27,7 @@ struct reservation_list {
 
 struct gres_task_state {
 	struct task_struct *tsk;
+	int hi_mode;
 	struct list_head res_list;
 	lt_t hi_exec_cost;
 	struct list_head hi_res_list;
@@ -44,7 +45,7 @@ struct gres_cpu_state {
 	struct task_struct* scheduled;
 };
 
-int hi_mode = 0;
+int hi_mode;
 
 static DEFINE_PER_CPU(struct gres_cpu_state, gres_cpu_state);
 
@@ -64,7 +65,7 @@ static void task_departs(struct task_struct *tsk, int job_complete)
 	struct list_head *list_to_use = &state->res_list;
 	struct reservation_list *rlist;
 
-	if (hi_mode && state->hi_exec_cost)
+	if (state->hi_mode && state->hi_exec_cost)
 		list_to_use = &state->hi_res_list;
 
 	list_for_each_entry(rlist, list_to_use, list) {
@@ -84,10 +85,10 @@ static void task_arrives(struct task_struct *tsk)
 	struct list_head *list_to_use = &state->res_list;
 	struct reservation_list *rlist;
 
-	if (hi_mode && state->hi_exec_cost)
+	if (state->hi_mode && state->hi_exec_cost)
 		list_to_use = &state->hi_res_list;
 
-	list_for_each_entry(rlist, &state->res_list, list) {
+	list_for_each_entry(rlist, list_to_use, list) {
 		client = rlist->client;
 		res    = client->reservation;
 
@@ -197,20 +198,38 @@ static enum hrtimer_restart on_scheduling_timer(struct hrtimer *timer)
 	return restart;
 }
 
+static void mode_change(int cpu) {
+	struct gres_cpu_state *state = cpu_state_for(cpu);
+	struct gres_task_state *tinfo;
+
+	raw_spin_lock(&state->lock);
+	hi_mode = 1;
+	if (state->scheduled) {
+	       	tinfo = get_gres_state(state->scheduled);
+		tsk_rt(tinfo->tsk)->task_params.exec_cost = tinfo->hi_exec_cost;
+		task_departs(tinfo->tsk, 0);
+		tinfo->hi_mode = 1;
+		if (tinfo->hi_exec_cost)
+			task_arrives(tinfo->tsk);
+	}
+	litmus_reschedule(cpu);
+	raw_spin_unlock(&state->lock);
+}
+
 static enum hrtimer_restart on_budget_overrun(struct hrtimer *timer)
 {
-	struct gres_task_state *tinfo;
+	int cpu;
+
+	if (hi_mode == 1) {
+		TRACE("budget overrun in HI mode... huho\n");
+		return HRTIMER_NORESTART;
+	}
 
 	TRACE("budget overrun!\n");
 
-	tinfo = container_of(timer, struct gres_task_state, budget_timer);
-	tsk_rt(tinfo->tsk)->task_params.exec_cost = tinfo->hi_exec_cost;
-	if (tinfo->hi_exec_cost)
-		task_departs(tinfo->tsk, 0);
-	hi_mode = 1;
-	if (tinfo->hi_exec_cost)
-		task_arrives(tinfo->tsk);
-	litmus_reschedule_local();
+	for_each_online_cpu(cpu) {
+		mode_change(cpu);
+	}
 	return HRTIMER_NORESTART;
 }
 
@@ -349,6 +368,7 @@ static long gres_admit_task(struct task_struct *tsk)
 		task_cpu(tsk), cpumask_test_cpu(task_cpu(tsk), &tsk->cpus_allowed));
 
 	tinfo->tsk = tsk;
+	tinfo->hi_mode = 0;
 	tinfo->curr_cpu = task_cpu(tsk);
 	hrtimer_init(&tinfo->budget_timer, CLOCK_MONOTONIC, HRTIMER_MODE_ABS);
 	tinfo->budget_timer.function = on_budget_overrun;
@@ -673,8 +693,6 @@ static long gres_deactivate_plugin(void)
 	int cpu;
 	struct gres_cpu_state *state;
 	struct reservation *res;
-
-	hi_mode = 0;
 
 	for_each_online_cpu(cpu) {
 		state = cpu_state_for(cpu);
