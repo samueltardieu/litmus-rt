@@ -27,6 +27,7 @@ struct reservation_list {
 
 struct gres_task_state {
 	struct task_struct *tsk;
+	struct list_head task_list;
 	int hi_mode;
 	struct list_head res_list;
 	lt_t hi_exec_cost;
@@ -46,6 +47,8 @@ struct gres_cpu_state {
 };
 
 int hi_mode;
+
+struct list_head task_list;
 
 static DEFINE_PER_CPU(struct gres_cpu_state, gres_cpu_state);
 
@@ -198,38 +201,45 @@ static enum hrtimer_restart on_scheduling_timer(struct hrtimer *timer)
 	return restart;
 }
 
-static void mode_change(int cpu) {
-	struct gres_cpu_state *state = cpu_state_for(cpu);
+static void mode_change(void) {
+	int cpu;
+	struct gres_cpu_state *state = local_cpu_state();
 	struct gres_task_state *tinfo;
 
 	raw_spin_lock(&state->lock);
 	hi_mode = 1;
-	if (state->scheduled) {
-	       	tinfo = get_gres_state(state->scheduled);
+	raw_spin_unlock(&state->lock);
+
+	list_for_each_entry(tinfo, &task_list, task_list) {
+		state = cpu_state_for(tinfo->curr_cpu);
+		raw_spin_lock(&state->lock);
+		hrtimer_try_to_cancel(&tinfo->budget_timer);
 		tsk_rt(tinfo->tsk)->task_params.exec_cost = tinfo->hi_exec_cost;
-		task_departs(tinfo->tsk, 0);
+		if (is_present(tinfo->tsk))
+			task_departs(tinfo->tsk, 0);
 		tinfo->hi_mode = 1;
 		if (tinfo->hi_exec_cost)
 			task_arrives(tinfo->tsk);
+		raw_spin_unlock(&state->lock);
 	}
-	litmus_reschedule(cpu);
-	raw_spin_unlock(&state->lock);
+
+	for_each_online_cpu(cpu) {
+		state = cpu_state_for(cpu);
+		raw_spin_lock(&state->lock);
+		litmus_reschedule(cpu);
+		raw_spin_unlock(&state->lock);
+	}
 }
 
 static enum hrtimer_restart on_budget_overrun(struct hrtimer *timer)
 {
-	int cpu;
-
 	if (hi_mode == 1) {
 		TRACE("budget overrun in HI mode... huho\n");
 		return HRTIMER_NORESTART;
 	}
 
 	TRACE("budget overrun!\n");
-
-	for_each_online_cpu(cpu) {
-		mode_change(cpu);
-	}
+	mode_change();
 	return HRTIMER_NORESTART;
 }
 
@@ -269,11 +279,9 @@ static struct task_struct* gres_schedule(struct task_struct * prev)
 		TRACE_TASK(state->scheduled, "scheduled.\n");
 		tinfo = get_gres_state(state->scheduled);
 		tinfo->curr_cpu = state->cpu;
-		if (!hi_mode) {
-			when_to_fire = litmus_clock() + budget_remaining(state->scheduled);
-			hrtimer_start(&tinfo->budget_timer, ns_to_ktime(when_to_fire),
-					HRTIMER_MODE_ABS);
-		}
+		when_to_fire = litmus_clock() + budget_remaining(state->scheduled);
+		hrtimer_start(&tinfo->budget_timer, ns_to_ktime(when_to_fire),
+				HRTIMER_MODE_ABS);
 	}
 
 	return state->scheduled;
@@ -368,7 +376,7 @@ static long gres_admit_task(struct task_struct *tsk)
 		task_cpu(tsk), cpumask_test_cpu(task_cpu(tsk), &tsk->cpus_allowed));
 
 	tinfo->tsk = tsk;
-	tinfo->hi_mode = 0;
+	tinfo->hi_mode = hi_mode;
 	tinfo->curr_cpu = task_cpu(tsk);
 	hrtimer_init(&tinfo->budget_timer, CLOCK_MONOTONIC, HRTIMER_MODE_ABS);
 	tinfo->budget_timer.function = on_budget_overrun;
@@ -415,6 +423,7 @@ static long gres_admit_task(struct task_struct *tsk)
 		raw_spin_lock_irqsave(&state->lock, flags);
 
 		tsk_rt(tsk)->plugin_state = tinfo;
+		list_add(&tinfo->task_list, &task_list);
 
 		/* disable LITMUS^RT's per-thread budget enforcement */
 		tsk_rt(tsk)->task_params.budget_policy = NO_ENFORCEMENT;
@@ -531,6 +540,7 @@ static void gres_task_exit(struct task_struct *tsk)
 		}
 	}
 
+	list_del(&tinfo->task_list);
 	kfree(tsk_rt(tsk)->plugin_state);
 	tsk_rt(tsk)->plugin_state = NULL;
 }
@@ -667,6 +677,7 @@ static long gres_activate_plugin(void)
 	struct gres_cpu_state *state;
 
 	hi_mode = 0;
+	INIT_LIST_HEAD(&task_list);
 
 	for_each_online_cpu(cpu) {
 		TRACE("Initializing CPU%d...\n", cpu);
