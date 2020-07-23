@@ -67,6 +67,9 @@ static void task_departs(struct task_struct *tsk, int job_complete)
 	struct reservation_client *client;
 	struct list_head *list_to_use = &state->res_list;
 	struct reservation_list *rlist;
+	
+	if (state->hi_mode && !state->hi_exec_cost)
+		return;
 
 	if (state->hi_mode && state->hi_exec_cost)
 		list_to_use = &state->hi_res_list;
@@ -87,6 +90,9 @@ static void task_arrives(struct task_struct *tsk)
 	struct reservation_client *client;
 	struct list_head *list_to_use = &state->res_list;
 	struct reservation_list *rlist;
+
+	if (state->hi_mode && !state->hi_exec_cost)
+		return;
 
 	if (state->hi_mode && state->hi_exec_cost)
 		list_to_use = &state->hi_res_list;
@@ -205,6 +211,8 @@ static void mode_change(void) {
 	int cpu;
 	struct gres_cpu_state *state = local_cpu_state();
 	struct gres_task_state *tinfo;
+	struct reservation_list *rlist;
+	struct reservation *res;
 
 	raw_spin_lock(&state->lock);
 	hi_mode = 1;
@@ -217,6 +225,10 @@ static void mode_change(void) {
 		tsk_rt(tinfo->tsk)->task_params.exec_cost = tinfo->hi_exec_cost;
 		if (is_present(tinfo->tsk))
 			task_departs(tinfo->tsk, 0);
+		list_for_each_entry(rlist, &tinfo->res_list, list) {
+			res = rlist->res;
+			res->env->change_state(res->env, res, RESERVATION_INACTIVE);
+		}
 		tinfo->hi_mode = 1;
 		if (tinfo->hi_exec_cost)
 			task_arrives(tinfo->tsk);
@@ -470,6 +482,14 @@ static void gres_task_new(struct task_struct *tsk, int on_runqueue,
 		/* Assumption: litmus_clock() is synchronized across cores
 		 * [see comment in gres_task_resume()] */
 		sup_update_time(&state->sup_env, litmus_clock());
+
+		if (!hi_mode && tinfo->hi_exec_cost) {
+			tinfo->hi_mode = 1;
+			task_arrives(tsk);
+			task_departs(tsk,0);
+			tinfo->hi_mode = 0;
+		}
+
 		task_arrives(tsk);
 		/* NOTE: drops state->lock */
 		gres_update_timer_and_unlock(state);
