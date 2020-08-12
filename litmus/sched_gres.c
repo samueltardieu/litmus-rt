@@ -222,7 +222,7 @@ static void mode_change(void) {
 		state = cpu_state_for(tinfo->curr_cpu);
 		raw_spin_lock(&state->lock);
 		hrtimer_try_to_cancel(&tinfo->budget_timer);
-		tsk_rt(tinfo->tsk)->task_params.exec_cost = tinfo->hi_exec_cost;
+		tsk_rt(tinfo->tsk)->task_params.exec_cost = tinfo->hi_exec_cost * 1000000;
 		if (is_present(tinfo->tsk))
 			task_departs(tinfo->tsk, 0);
 		list_for_each_entry(rlist, &tinfo->res_list, list) {
