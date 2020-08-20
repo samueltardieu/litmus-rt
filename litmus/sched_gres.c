@@ -230,7 +230,7 @@ static void mode_change(void) {
 			res->env->change_state(res->env, res, RESERVATION_INACTIVE);
 		}
 		tinfo->hi_mode = 1;
-		if (tinfo->hi_exec_cost)
+		if (is_present(tinfo->tsk) && tinfo->hi_exec_cost)
 			task_arrives(tinfo->tsk);
 		raw_spin_unlock(&state->lock);
 	}
