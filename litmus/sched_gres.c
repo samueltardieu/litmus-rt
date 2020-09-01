@@ -28,10 +28,12 @@ struct reservation_list {
 struct gres_task_state {
 	struct task_struct *tsk;
 	struct list_head task_list;
-	int hi_mode;
 	struct list_head res_list;
+#ifdef SCHED_MCDAG
+	int hi_mode;
 	lt_t hi_exec_cost;
 	struct list_head hi_res_list;
+#endif // SCHED_MCDAG
 	int curr_cpu;
 	struct hrtimer budget_timer;
 };
@@ -44,16 +46,48 @@ struct gres_cpu_state {
 
 	int cpu;
 	struct task_struct* scheduled;
+	// True if the previous task that we expect to unschedule was
+	// a real time task.
+	int prev_was_realtime;
+
+#ifdef SCHED_MCDAG
+	// The criticity mode last seen by this CPU.
+	int hi_mode;
+#endif
+
+	lt_t migration_contention_start;
 };
 
-int hi_mode;
+#ifdef SCHED_MCDAG
+// The current mode
+static atomic_t hi_mode;
+
+// CPU that still haven't changed mode
+static atomic_t hi_mode_missing_cpus;
+
+// Number of online CPUs
+static unsigned cpu_count;
+
+// Mode change start date
+lt_t mode_change_start_date;
+#endif // SCHED_MCDAG
+
+#ifdef SCHED_MCDAG
+static const char *mode_name(int hi_mode) {
+	return hi_mode ? "HI" : "LO";
+}
+#endif // SCHED_MCDAG
 
 struct list_head task_list;
+
+static char plugin_name[128];
 
 static DEFINE_PER_CPU(struct gres_cpu_state, gres_cpu_state);
 
 #define cpu_state_for(cpu_id)	(&per_cpu(gres_cpu_state, cpu_id))
 #define local_cpu_state()	(this_cpu_ptr(&gres_cpu_state))
+
+static void gres_task_exit(struct task_struct *tsk);
 
 static struct gres_task_state* get_gres_state(struct task_struct *tsk)
 {
@@ -68,11 +102,13 @@ static void task_departs(struct task_struct *tsk, int job_complete)
 	struct list_head *list_to_use = &state->res_list;
 	struct reservation_list *rlist;
 	
+#ifdef SCHED_MCDAG
 	if (state->hi_mode && !state->hi_exec_cost)
 		return;
 
 	if (state->hi_mode && state->hi_exec_cost)
 		list_to_use = &state->hi_res_list;
+#endif // SCHED_MCDAG
 
 	list_for_each_entry(rlist, list_to_use, list) {
 		client = rlist->client;
@@ -91,11 +127,13 @@ static void task_arrives(struct task_struct *tsk)
 	struct list_head *list_to_use = &state->res_list;
 	struct reservation_list *rlist;
 
+#ifdef SCHED_MCDAG
 	if (state->hi_mode && !state->hi_exec_cost)
 		return;
 
 	if (state->hi_mode && state->hi_exec_cost)
 		list_to_use = &state->hi_res_list;
+#endif // SCHED_MCDAG
 
 	list_for_each_entry(rlist, list_to_use, list) {
 		client = rlist->client;
@@ -207,16 +245,32 @@ static enum hrtimer_restart on_scheduling_timer(struct hrtimer *timer)
 	return restart;
 }
 
-static void mode_change(void) {
+#ifdef SCHED_MCDAG
+static void record_mode_change_in_name(void) {
+	sprintf(plugin_name, "G-RES (mode %s)", mode_name(atomic_read(&hi_mode)));
+}
+#endif // SCHED_MCDAG
+
+#ifdef SCHED_MCDAG
+static void mode_change(int prev_hi_mode) {
 	int cpu;
 	struct gres_cpu_state *state = local_cpu_state();
 	struct gres_task_state *tinfo;
 	struct reservation_list *rlist;
 	struct reservation *res;
+	int target_hi_mode = prev_hi_mode + 1;
 
-	raw_spin_lock(&state->lock);
-	hi_mode = 1;
-	raw_spin_unlock(&state->lock);
+	TRACE("changing mode from %s to %s\n", mode_name(prev_hi_mode), mode_name(target_hi_mode));
+
+	if (atomic_cmpxchg(&hi_mode, prev_hi_mode, target_hi_mode) != prev_hi_mode) {
+		TRACE("attempt to change mode while previous mode is not %s\n", mode_name(prev_hi_mode));
+		return;
+	}
+	mode_change_start_date = litmus_clock();
+	atomic_set(&hi_mode_missing_cpus, cpu_count - 1);
+	state->hi_mode = target_hi_mode;
+
+	record_mode_change_in_name();
 
 	list_for_each_entry(tinfo, &task_list, task_list) {
 		state = cpu_state_for(tinfo->curr_cpu);
@@ -242,16 +296,25 @@ static void mode_change(void) {
 		raw_spin_unlock(&state->lock);
 	}
 }
+#endif // SCHED_MCDAG
 
 static enum hrtimer_restart on_budget_overrun(struct hrtimer *timer)
 {
-	if (hi_mode == 1) {
+#ifdef SCHED_MCDAG
+	if (atomic_read(&hi_mode) == 1) {
 		TRACE("budget overrun in HI mode... huho\n");
 		return HRTIMER_NORESTART;
 	}
+#endif // SCHED_MCDAG
 
 	TRACE("budget overrun!\n");
-	mode_change();
+
+#ifdef SCHED_MCDAG
+	// Attempt mode chance. If a mode change is already in progress,
+	// do nothing as a rescheduling will take place shortly.
+	mode_change(local_cpu_state()->hi_mode);
+#endif // SCHED_MCDAG
+
 	return HRTIMER_NORESTART;
 }
 
@@ -264,8 +327,32 @@ static struct task_struct* gres_schedule(struct task_struct * prev)
 
 	raw_spin_lock(&state->lock);
 
-	BUG_ON(state->scheduled && state->scheduled != prev);
-	BUG_ON(state->scheduled && !is_realtime(prev));
+#ifdef SCHED_MCDAG
+	{
+		int global_hi_mode = atomic_read_acquire(&hi_mode);
+		if (global_hi_mode != state->hi_mode) {
+			TRACE("switching from state %s to state %s\n", mode_name(state->hi_mode), mode_name(global_hi_mode));
+			if (!atomic_dec_return(&hi_mode_missing_cpus)) {
+				char buffer[100];
+				lt_t time_ns = litmus_clock() - mode_change_start_date;
+				TRACE("full mode change took %lld ns\n", time_ns);
+				sprintf(buffer, " - %d cpus %lld ns", cpu_count, time_ns);
+				strcat(plugin_name, buffer);
+			}
+			state->hi_mode = global_hi_mode;
+		}
+	}
+#endif // SCHED_MCDAG
+
+	// We have already chosen a task but we had to relinquish
+	// it because there was a potential deadlock risk when trying
+	// to acquire it.
+	if (state->scheduled && state->scheduled != prev) {
+	  TRACE_TASK(state->scheduled, "new attempt to get scheduled here\n");
+	  // XXXXX Check if there is a possibility of optimization here
+	  // by returning early (after unlocking) and so on.
+	} else if (state->scheduled && state->scheduled == prev)
+	  BUG_ON(!is_realtime(prev));
 
 	/* update time */
 	state->sup_env.will_schedule = true;
@@ -273,6 +360,7 @@ static struct task_struct* gres_schedule(struct task_struct * prev)
 
 	/* figure out what to schedule next */
 	state->scheduled = sup_dispatch(&state->sup_env);
+	state->prev_was_realtime = is_realtime(prev);
 
 	/* Notify LITMUS^RT core that we've arrived at a scheduling decision. */
 	sched_state_task_picked();
@@ -388,14 +476,18 @@ static long gres_admit_task(struct task_struct *tsk)
 		task_cpu(tsk), cpumask_test_cpu(task_cpu(tsk), &tsk->cpus_allowed));
 
 	tinfo->tsk = tsk;
-	tinfo->hi_mode = hi_mode;
+#ifdef SCHED_MCDAG
+	tinfo->hi_mode = atomic_read(&hi_mode);
+#endif // SCHED_MCDAG
 	tinfo->curr_cpu = task_cpu(tsk);
 	hrtimer_init(&tinfo->budget_timer, CLOCK_MONOTONIC, HRTIMER_MODE_ABS);
 	tinfo->budget_timer.function = on_budget_overrun;
 	INIT_LIST_HEAD(&tinfo->res_list);
+#ifdef SCHED_MCDAG
 	tinfo->hi_exec_cost = tsk_rt(tsk)->task_params.hi_exec_cost;
 	if (tinfo->hi_exec_cost)
 		INIT_LIST_HEAD(&tinfo->hi_res_list);
+#endif // SCHED_MCDAG
 
 	for_each_online_cpu(cpu) {
 		state = cpu_state_for(cpu);
@@ -414,6 +506,7 @@ static long gres_admit_task(struct task_struct *tsk)
 			err = 0;
 		}
 
+#ifdef SCHED_MCDAG
 		if (tinfo->hi_exec_cost) {
 			res = sup_find_by_id(&state->sup_env,
 					tsk_rt(tsk)->task_params.hi_res_id);
@@ -426,6 +519,7 @@ static long gres_admit_task(struct task_struct *tsk)
 				list_add(&new_res->list, &tinfo->hi_res_list);
 			}
 		}
+#endif // SCHED_MCDAG
 
 		raw_spin_unlock_irqrestore(&state->lock, flags);
 	}
@@ -483,12 +577,14 @@ static void gres_task_new(struct task_struct *tsk, int on_runqueue,
 		 * [see comment in gres_task_resume()] */
 		sup_update_time(&state->sup_env, litmus_clock());
 
-		if (!hi_mode && tinfo->hi_exec_cost) {
+#ifdef SCHED_MCDAG
+		if (!atomic_read(&hi_mode) && tinfo->hi_exec_cost) {
 			tinfo->hi_mode = 1;
 			task_arrives(tsk);
 			task_departs(tsk,0);
 			tinfo->hi_mode = 0;
 		}
+#endif // SCHED_MCDAG
 
 		task_arrives(tsk);
 		/* NOTE: drops state->lock */
@@ -551,6 +647,7 @@ static void gres_task_exit(struct task_struct *tsk)
 		kfree(rlist);
 	}
 
+#ifdef SCHED_MCDAG
 	if (tinfo->hi_exec_cost) {
 		while (!list_empty(&tinfo->hi_res_list)) {
 			rlist = list_first_entry(&tinfo->hi_res_list,
@@ -559,6 +656,7 @@ static void gres_task_exit(struct task_struct *tsk)
 			kfree(rlist);
 		}
 	}
+#endif // SCHED_MCDAG
 
 	list_del(&tinfo->task_list);
 	kfree(tsk_rt(tsk)->plugin_state);
@@ -696,7 +794,11 @@ static long gres_activate_plugin(void)
 	int cpu;
 	struct gres_cpu_state *state;
 
-	hi_mode = 0;
+#ifdef SCHED_MCDAG
+	atomic_set(&hi_mode, 0);
+	cpu_count = 0;
+	record_mode_change_in_name();
+#endif // SCHED_MCDAG
 	INIT_LIST_HEAD(&task_list);
 
 	for_each_online_cpu(cpu) {
@@ -712,6 +814,11 @@ static long gres_activate_plugin(void)
 
 		hrtimer_init(&state->timer, CLOCK_MONOTONIC, HRTIMER_MODE_ABS_PINNED);
 		state->timer.function = on_scheduling_timer;
+
+#ifdef SCHED_MCDAG
+		state->hi_mode = 0;
+		cpu_count++;
+#endif // SCHED_MCDAG
 	}
 
 	gres_setup_domain_proc();
@@ -748,11 +855,44 @@ static long gres_deactivate_plugin(void)
 	}
 
 	destroy_domain_proc_info(&gres_domain_proc_info);
+	strcpy(plugin_name, "G-RES");
 	return 0;
 }
 
+static bool gres_post_migration_validate(struct task_struct *next) {
+	struct gres_cpu_state *state = local_cpu_state();
+	if (state->migration_contention_start) {
+		TRACE_TASK(next, "in post_migration_validate - migration took %lld ns\n",
+		    litmus_clock() - state->migration_contention_start);
+		state->migration_contention_start = 0;
+	} else
+	    TRACE_TASK(next, "in post_migration_validate\n");
+	return 1;
+}
+
+static void gres_next_became_invalid(struct task_struct *next) {
+	TRACE_TASK(next, "in next_became_invalid\n");
+}
+
+static bool gres_should_wait_for_stack(struct task_struct *next) {
+	struct gres_cpu_state *state = local_cpu_state();
+	if (!state->migration_contention_start)
+		state->migration_contention_start = litmus_clock();
+	TRACE_TASK(next, "target is not ready, release the lock right now\n");
+	if (state->prev_was_realtime) {
+		// Cancel timers, they will be set again when we pick the same
+		// task again.
+		hrtimer_cancel(&state->timer);
+		return false;
+	} else {
+		// We have no task to unschedule that could be implicated in
+		// a deadlock. Hang on our current choice.
+		return true;
+	}
+}
+
 static struct sched_plugin gres_plugin = {
-	.plugin_name		= "G-RES",
+	.plugin_name		= plugin_name,
 	.schedule		= gres_schedule,
 	.task_block		= gres_task_block,
 	.task_wake_up		= gres_task_resume,
@@ -766,10 +906,14 @@ static struct sched_plugin gres_plugin = {
 	.deactivate_plugin      = gres_deactivate_plugin,
 	.reservation_create     = gres_reservation_create,
 	.current_budget         = gres_current_budget,
+	.should_wait_for_stack  = gres_should_wait_for_stack,
+	.next_became_invalid    = gres_next_became_invalid,
+	.post_migration_validate = gres_post_migration_validate,
 };
 
 static int __init init_gres(void)
 {
+	strcpy(plugin_name, "G-RES");
 	return register_sched_plugin(&gres_plugin);
 }
 
