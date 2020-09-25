@@ -224,6 +224,19 @@ bool gtd_reservation_find_interval(struct gtd_reservation *gtdres, lt_t time,
 	return false;
 }
 
+struct gtd_interval *
+gtd_reservation_next_interval(const struct gtd_reservation *gtdres,
+			      const struct gtd_interval *gtdinterval,
+			      lt_t *major_cycle_start)
+{
+	const struct list_head *next = gtdinterval->list.next;
+	if (next == &gtdres->intervals) {
+		next = next->next;
+		*major_cycle_start += gtdres->major_cycle;
+	}
+	return container_of(next, struct gtd_interval, list);
+}
+
 static bool is_right_cpu(struct gtd_interval *interval, void *cpu)
 {
 	return interval->cpu == *(int *)cpu;

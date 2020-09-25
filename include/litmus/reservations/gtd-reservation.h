@@ -72,6 +72,13 @@ bool gtd_reservation_find_interval(struct gtd_reservation *gtdres, lt_t time,
 				   lt_t *major_cycle_start,
 				   gtd_interval_filter_t filter, void *opaque);
 
+// Return the next interval in the reservation. major_cycle_start is incremented
+// by the major cycle if the intervals wrap around.
+struct gtd_interval *
+gtd_reservation_next_interval(const struct gtd_reservation *gtdres,
+			      const struct gtd_interval *gtdinterval,
+			      lt_t *major_cycle_start);
+
 // Environment for holding known reservations
 struct gtd_env {
 	// All reservations

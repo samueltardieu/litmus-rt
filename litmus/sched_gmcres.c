@@ -27,22 +27,15 @@ struct gmcres_cpu_state {
 	// The current CPU number, for easy reference
 	int cpu;
 
-	// The current (if in_interval is set) or next reservation and interval, as well
-	// as the major_cycle_start offset to apply to the interval.
-	bool in_interval;
-	struct gtd_reservation *current_res;
-	struct gtd_interval *interval;
-	lt_t major_cycle_start;
-
 	// True after scheduling if the task we have descheduled last was a real-time
 	// task (i.e. if the task may be implicated in a deadlock between Litmus tasks).
 	bool prev_was_realtime;
 
-	// Timer set to the end of the current interval or beginning of the next interval.
-	struct hrtimer scheduling_timer;
-
 	// Task being current scheduled
 	struct task_struct *scheduled;
+
+	// Task interested in being scheduled
+	struct task_struct *linked;
 };
 
 static DEFINE_PER_CPU(struct gmcres_cpu_state, gmcres_cpu_state);
@@ -51,11 +44,20 @@ static DEFINE_PER_CPU(struct gmcres_cpu_state, gmcres_cpu_state);
 #define local_cpu_state() (this_cpu_ptr(&gmcres_cpu_state))
 
 struct gmcres_task_state {
+	raw_spinlock_t lock;
+
 	// The reservation associated to this task, cannot be NULL once the task
-	// has been admitted.
+	// has been admitted, and contains the reserve link to the struct task_struct * entry.
 	struct gtd_reservation *gtdres;
-	// The CPU this task is scheduled (or would be scheduled if not suspended) on.
-	int cpu;
+
+	// The current interval, cannot be NULL once the task has been started, and
+	// the associated major cycle start time.
+	struct gtd_interval *gtdinterval;
+	lt_t major_cycle_start;
+
+	// The timer associated with beginning or end of intervals, is always
+	// armed when the task has been admitted.
+	struct hrtimer interval_timer;
 };
 
 static struct gmcres_task_state *get_gmcres_task_state(struct task_struct *tsk)
@@ -71,158 +73,120 @@ static struct gmcres_task_state *get_gmcres_task_state(struct task_struct *tsk)
 		      irqs_disabled());                                                    \
 	} while (0)
 
-static enum hrtimer_restart on_scheduling_timer(struct hrtimer *timer)
+static enum hrtimer_restart on_interval_timer(struct hrtimer *timer)
 {
-	struct gmcres_cpu_state *state =
-		container_of(timer, struct gmcres_cpu_state, scheduling_timer);
-	WARN_ON(state->cpu != raw_smp_processor_id());
-	TRACE("Scheduling timer event at %llu on CPU %d\n", litmus_clock(),
-	      state->cpu);
-	litmus_reschedule_local();
-	return HRTIMER_NORESTART;
+	struct gmcres_task_state *tinfo =
+		container_of(timer, struct gmcres_task_state, interval_timer);
+	struct task_struct *tsk = tinfo->gtdres->task;
+	struct gmcres_cpu_state *state;
+	lt_t now, start, end;
+	unsigned long flags;
+	int previous_cpu, next_cpu;
+	bool is_inside_interval, is_running;
+
+	raw_spin_lock_irqsave(&tinfo->lock, flags);
+	now = litmus_clock();
+
+	// Is the task currently running?
+	is_running = tsk->state == TASK_RUNNING;
+
+	// Remember the previous CPU this task could have been scheduled on
+	previous_cpu = tinfo->gtdinterval->cpu;
+
+	TRACE_TASK(
+		tsk,
+		"(is_running:%d) executes on_interval_timer at %llu for interval [%llu-%llu) (cpu %d)\n",
+		is_running, now,
+		tinfo->major_cycle_start + tinfo->gtdinterval->start,
+		tinfo->major_cycle_start + tinfo->gtdinterval->end,
+		previous_cpu);
+
+	// Advance intervals as much as needed and compute start, end, is_inside_interval
+	while ((end = tinfo->major_cycle_start + tinfo->gtdinterval->end) <=
+	       now)
+		tinfo->gtdinterval = gtd_reservation_next_interval(
+			tinfo->gtdres, tinfo->gtdinterval,
+			&tinfo->major_cycle_start);
+	start = tinfo->major_cycle_start + tinfo->gtdinterval->start;
+	is_inside_interval = now >= start;
+
+	TRACE_TASK(
+		tsk,
+		"has computed new interval [%llu-%llu) (cpu %d) (is_inside_interval:%d)\n",
+		start, end, tinfo->gtdinterval->cpu, is_inside_interval);
+
+	// Check the next CPU to use, or NO_CPU
+	next_cpu = is_inside_interval && is_running ? tinfo->gtdinterval->cpu :
+							    NO_CPU;
+
+	// Mark and reschedule concerned CPUs
+	state = cpu_state_for(previous_cpu);
+	raw_spin_lock(&state->lock);
+	if (next_cpu == previous_cpu) {
+		TRACE_TASK(tsk, "requesting scheduling on CPU %d\n", next_cpu);
+		state->linked = tsk;
+		if (state->scheduled != tsk)
+			litmus_reschedule(previous_cpu);
+	} else if (state->linked == tsk) {
+		TRACE_TASK(tsk, "requesting descheduling from CPU %d\n",
+			   previous_cpu);
+		state->linked = NULL;
+		litmus_reschedule(previous_cpu);
+	}
+	// Note: if we have state->linked != tsk and state->scheduled == tsk,
+	// then another task has requested a rescheduling in order to satisfy
+	// its recent "linked" requirement, no need to schedule an extra one.
+	raw_spin_unlock(&state->lock);
+
+	if (next_cpu != previous_cpu && next_cpu != NO_CPU) {
+		state = cpu_state_for(next_cpu);
+		raw_spin_lock(&state->lock);
+		TRACE_TASK(tsk, "requesting scheduling on CPU %d\n", next_cpu);
+		state->linked = tsk;
+		litmus_reschedule(next_cpu);
+		raw_spin_unlock(&state->lock);
+	}
+	raw_spin_unlock_irqrestore(&tinfo->lock, flags);
+
+	// Set next timer
+	TRACE_TASK(
+		tsk,
+		"setting next timer at %llu to interval [%llu-%llu) %s: %llu\n",
+		now, start, end, is_inside_interval ? "end" : "start",
+		is_inside_interval ? end : start);
+	hrtimer_set_expires(timer,
+			    ns_to_ktime(is_inside_interval ? end : start));
+
+	return HRTIMER_RESTART;
 }
 
 static struct task_struct *gmcres_schedule(struct task_struct *prev)
 {
 	struct gmcres_cpu_state *state = local_cpu_state();
-	lt_t now = litmus_clock();
-	struct task_struct *tsk = NULL;
+	lt_t now;
 
 	raw_spin_lock(&state->lock);
+
+	now = litmus_clock();
 
 	// Sanity checks and previous task information
 	WARN_ON(state->scheduled && state->scheduled != prev);
 	state->prev_was_realtime = prev && is_realtime(prev);
+	WARN_ON(state->scheduled && !state->prev_was_realtime);
 
-	// If the current interval we were in has expired or if we were not
-	// in an interval, find a new interval.
-	// TODO: can be optimized when we add chaining of per-CPU intervals
-	if (!state->in_interval ||
-	    now > state->major_cycle_start + state->interval->end) {
-		lt_t old_start = GTDRES_TIME_NA, start = GTDRES_TIME_NA,
-		     end = GTDRES_TIME_NA;
-		bool in_interval, has_interval, interval_changed;
-
-		// If the current CPU was already of a previous interval (being in it
-		// or waiting for it), store its beginning (which is unique per CPU)
-		// in order to be able to detect a change later.
-		if (state->interval)
-			old_start = state->major_cycle_start +
-				    state->interval->start;
-
-		in_interval = gtd_env_find_interval(&gtdenv, now, state->cpu,
-						    &state->current_res,
-						    &state->interval,
-						    &state->major_cycle_start);
-		has_interval = !!state->current_res;
-
-		// Sanity checks:
-		//  1- If we are in an interval, we must have a reservation
-		//  2- We must either have a reservation, interval and valid major cycle start,
-		//     or none at all.
-		WARN_ON(in_interval && !has_interval);
-		WARN_ON(has_interval ^ !!state->interval);
-		WARN_ON(has_interval ^
-			(state->major_cycle_start != GTDRES_TIME_NA));
-
-		// Compute the offset start and end time of the current or next interval
-		// if one is known.
-		if (has_interval) {
-			start = state->major_cycle_start +
-				state->interval->start;
-			end = state->major_cycle_start + state->interval->end;
-		}
-
-		// We consider an interval change as being either entering in an interval
-		// or changing intervals. We should never be in a situation where we are
-		// leaving an interval but the interval and major cycle start stay the same.
-		WARN_ON(state->in_interval && !in_interval && has_interval &&
-			old_start == start);
-		interval_changed = (!state->in_interval && in_interval) ||
-				   !has_interval || old_start != start;
-		state->in_interval = in_interval;
-
-		// If interval has changed, set up the timer to trigger at the next change event,
-		// and indicate to the task (if any) that was or could have been executing its
-		// next CPU target.
-		if (interval_changed) {
-			if (in_interval) {
-				TRACE("CPU %d: at %llu, in interval [%llu-%llu] of res %u\n",
-				      state->cpu, now, start, end,
-				      state->current_res->res.id);
-				// Ask to be scheduled at the end of the interval
-				TRACE("scheduling end-of-interval timer at %llu\n",
-				      end);
-				hrtimer_start(&state->scheduling_timer,
-					      ns_to_ktime(end),
-					      HRTIMER_MODE_ABS_PINNED);
-			} else if (state->current_res) {
-				// We have found the next interval
-				TRACE("CPU %d: at %llu, next interval is [%llu-%llu] of res %u\n",
-				      state->cpu, now, start, end,
-				      state->current_res->res.id);
-				// Ask to be scheduled at the beginning of the interval
-				TRACE("scheduling start-of-interval timer at %llu\n",
-				      start);
-				hrtimer_start(&state->scheduling_timer,
-					      ns_to_ktime(start),
-					      HRTIMER_MODE_ABS_PINNED);
-			}
-		}
+	// Link the task we were asked to link
+	if (state->scheduled != state->linked) {
+		if (state->scheduled)
+			TRACE_TASK(state->scheduled, "descheduled at %llu\n",
+				   now);
+		if (state->linked)
+			TRACE_TASK(state->linked, "scheduled at %llu\n", now);
 	}
-
-	// Select the task to run from the reservation
-	if (state->in_interval) {
-		raw_spin_lock(&state->current_res->lock);
-		tsk = state->current_res->task;
-		if (tsk) {
-			// Don't schedule a task with NO_CPU, it didn't go through task_new yet
-			// or it is beging destroyed.
-			if (tsk->cpu == NO_CPU) {
-				TRACE_TASK(
-					tsk,
-					"is not scheduled because it reads NO_CPU\n");
-				tsk = NULL;
-			} else {
-				if (tsk->cpu != state->cpu)
-					TRACE_TASK(
-						tsk,
-						"marked as requiring CPU %u instead of CPU %u\n",
-						state->cpu, tsk->cpu);
-				tsk->cpu = state->cpu;
-				// If the task is not currently running, don't schedule it.
-				if (tsk->state != TASK_RUNNING)
-					tsk = NULL;
-			}
-		}
-		raw_spin_unlock(&state->current_res->lock);
-	}
-
+	state->scheduled = state->linked;
 	sched_state_task_picked();
 
-	if (tsk && !is_released(tsk, litmus_clock()))
-		tsk = NULL;
-
-	if (state->scheduled != tsk) {
-		if (state->scheduled)
-			TRACE_TASK(state->scheduled, "is descheduled at %llu\n",
-				   now);
-		if (tsk)
-			TRACE_TASK(tsk, "is scheduled at %llu\n", now);
-		if (state->scheduled && !tsk)
-			TRACE("entering idling mode at %llu\n", now);
-	}
-
-	state->scheduled = tsk;
 	raw_spin_unlock(&state->lock);
 
-	// XXXXX Last check
-	if (state->scheduled && state->current_res->task != state->scheduled) {
-		TRACE("Task has been obviously removed from reservation\n");
-		WARN_ON(true);
-		TRACE_TASK(state->scheduled, "This one");
-		state->scheduled = NULL;
-	}
 	return state->scheduled;
 }
 
@@ -253,8 +217,12 @@ static long gmcres_admit_task(struct task_struct *tsk)
 		return -ENOMEM;
 
 	preempt_disable();
-	tinfo->cpu = NO_CPU;
+	raw_spin_lock_init(&tinfo->lock);
 	tinfo->gtdres = gtdres;
+	tinfo->gtdinterval = NULL;
+	tinfo->major_cycle_start = GTDRES_TIME_NA;
+	hrtimer_init(&tinfo->interval_timer, CLOCK_MONOTONIC, HRTIMER_MODE_ABS);
+	tinfo->interval_timer.function = on_interval_timer;
 	tsk_rt(tsk)->plugin_state = tinfo;
 
 	// Attempt attachment to the reservation
@@ -279,19 +247,45 @@ static long gmcres_admit_task(struct task_struct *tsk)
 	raw_spin_unlock(&gtdres->lock);
 	preempt_enable();
 
-	TRACE_TASK(tsk, "has been accepted by the G-MCRES plugin\n");
 	return 0;
+}
+
+// Compute the date of the next timer related to the task tsk and the time
+// now. This must be called with interrupts disabled and the task structure locked.
+static lt_t next_task_timer(struct gmcres_task_state *tinfo, lt_t now)
+{
+	lt_t start = tinfo->major_cycle_start + tinfo->gtdinterval->start;
+	if (start > now)
+		return start;
+	return tinfo->major_cycle_start + tinfo->gtdinterval->end;
 }
 
 static void gmcres_task_new(struct task_struct *tsk, int on_runqueue,
 			    int is_running)
 {
-	struct gmcres_cpu_state *state = local_cpu_state();
 	struct gmcres_task_state *tinfo = get_gmcres_task_state(tsk);
-	struct gtd_interval *interval;
-	lt_t major_cycle_start, now = litmus_clock();
-	bool is_inside_interval;
+	lt_t now, next_timer;
 	unsigned long flags;
+	bool is_inside_interval;
+	int wanted_cpu, current_cpu;
+
+	raw_spin_lock_irqsave(&tinfo->lock, flags);
+	now = litmus_clock();
+	is_inside_interval = gtd_reservation_find_interval(
+		tinfo->gtdres, now, &tinfo->gtdinterval,
+		&tinfo->major_cycle_start, NULL, NULL);
+	BUG_ON(!tinfo->gtdinterval);
+	TRACE_TASK(
+		tsk,
+		"registers interest for interval [%llu-%llu) (is_inside_interval:%d)\n",
+		tinfo->major_cycle_start + tinfo->gtdinterval->start,
+		tinfo->major_cycle_start + tinfo->gtdinterval->end,
+		is_inside_interval);
+	next_timer = next_task_timer(tinfo, now);
+	TRACE_TASK(tsk, "will set first timer for %llu (now is %llu)\n",
+		   next_timer, now);
+	hrtimer_start(&tinfo->interval_timer, ns_to_ktime(next_timer),
+		      HRTIMER_MODE_ABS);
 
 	TRACE_TASK(tsk,
 		   "is a new RT task at %llu (on runqueue:%d, running:%d)\n",
@@ -300,42 +294,63 @@ static void gmcres_task_new(struct task_struct *tsk, int on_runqueue,
 	// Setup job parameters
 	release_at(tsk, now);
 
-	// Look for the next CPU that should be interested in this task
-	is_inside_interval = gtd_reservation_find_interval(
-		tinfo->gtdres, now, &interval, &major_cycle_start, NULL, NULL);
-	BUG_ON(!interval);
+	// Compute the wanted CPU or NO_CPU
+	wanted_cpu = is_inside_interval ? tinfo->gtdinterval->cpu : NO_CPU;
 
-	raw_spin_lock_irqsave(&state->lock, flags);
 	if (is_running) {
-		tinfo->cpu = state->cpu;
+		// Register the task as running on the current CPU. Insist on
+		// staying there if this is the right CPU.
+		struct gmcres_cpu_state *state = local_cpu_state();
+		raw_spin_lock(&state->lock);
+		current_cpu = state->cpu;
+		WARN_ON(state->scheduled);
 		state->scheduled = tsk;
-		if (state->cpu != interval->cpu)
-			litmus_reschedule(interval->cpu);
-		litmus_reschedule_local();
-	} else
-		tinfo->cpu = interval->cpu;
-	raw_spin_unlock_irqrestore(&state->lock, flags);
+		TRACE_TASK(tsk, "registered as currently running here\n");
+		if (current_cpu == wanted_cpu) {
+			TRACE_TASK(tsk, "is currently on the CPU it wants\n");
+			state->linked = tsk;
+		}
+		raw_spin_unlock(&state->lock);
+
+		// If we want the task to run right now on another CPU, tell it
+		// to do so and reschedule both the current CPU to release the
+		// task and the wanted one to schedule the task.
+		if (wanted_cpu != NO_CPU && wanted_cpu != current_cpu) {
+			struct gmcres_cpu_state *state =
+				cpu_state_for(wanted_cpu);
+			raw_spin_lock(&state->lock);
+			state->linked = tsk;
+			TRACE_TASK(tsk, "is requesting to run on CPU %d\n",
+				   wanted_cpu);
+			raw_spin_unlock(&state->lock);
+			litmus_reschedule_local();
+			litmus_reschedule(wanted_cpu);
+		}
+	}
+	raw_spin_unlock_irqrestore(&tinfo->lock, flags);
 }
 
 static void gmcres_task_exit(struct task_struct *tsk)
 {
 	struct gmcres_task_state *tinfo = get_gmcres_task_state(tsk);
-	struct gtd_reservation *gtdres;
 	int cpu;
 	unsigned long flags;
 
 	TRACE_TASK(tsk, "exiting at %llu\n", litmus_clock());
 
+	// Ensure that the timer can no longer fire
+	hrtimer_cancel(&tinfo->interval_timer);
+
+	raw_spin_lock_irqsave(&tinfo->lock, flags);
+
 	// Remove the task from the reservation so that it will no
 	// longer be scheduled.
-	gtdres = tinfo->gtdres;
-	WARN_ON(gtdres->task != tsk);
-	raw_spin_lock_irqsave(&gtdres->lock, flags);
-	gtdres->task = NULL;
-	tinfo->cpu = NO_CPU;
-	raw_spin_unlock(&gtdres->lock);
+	raw_spin_lock_irqsave(&tinfo->gtdres->lock, flags);
+	BUG_ON(tinfo->gtdres->task != tsk);
+	tinfo->gtdres->task = NULL;
+	raw_spin_unlock(&tinfo->gtdres->lock);
 
-	// If the task is scheduled on any CPU, deschedule it.
+	// If the task is scheduled on any CPU, deschedule it and deschedule requests.
 	for_each_online_cpu (cpu) {
 		struct gmcres_cpu_state *state = cpu_state_for(cpu);
 		raw_spin_lock_irqsave(&state->lock, flags);
@@ -346,13 +361,18 @@ static void gmcres_task_exit(struct task_struct *tsk)
 				cpu);
 			state->scheduled = NULL;
 		}
+		if (state->linked == tsk) {
+			TRACE_TASK(
+				tsk,
+				"has been forcefully derequested from CPU %d\n",
+				cpu);
+			state->linked = NULL;
+		}
 		raw_spin_unlock_irqrestore(&state->lock, flags);
 	}
-	WARN_ON(tinfo->cpu != NO_CPU);
 
-	WRITE_ONCE(tsk_rt(tsk)->plugin_state, NULL);
+	tsk_rt(tsk)->plugin_state = NULL;
 	kfree(tinfo);
-	local_irq_restore(flags);
 }
 
 static long gmcres_reservation_create(int res_type, void *__user _config)
@@ -433,10 +453,13 @@ static bool gmcres_should_wait_for_stack(struct task_struct *next)
 		raw_spin_unlock_irqrestore(&state->lock, flags);
 		TRACE_TASK(next, "relinguished for now to avoid deadlock\n");
 		return false;
+	} else {
+		raw_spin_unlock_irqrestore(&state->lock, flags);
+		TRACE_TASK(
+			next,
+			"cannot be implicated in a deadlock, not giving up\n");
+		return true;
 	}
-	raw_spin_unlock_irqrestore(&state->lock, flags);
-	TRACE_TASK(next, "cannot be implicated in a deadlock, not giving up\n");
-	return true;
 }
 
 static bool gmcres_fork_task(struct task_struct *tsk)
@@ -447,38 +470,80 @@ static bool gmcres_fork_task(struct task_struct *tsk)
 
 static void gmcres_task_block(struct task_struct *tsk)
 {
-	struct gmcres_cpu_state *state = local_cpu_state();
+	struct gmcres_task_state *tinfo = get_gmcres_task_state(tsk);
+	struct gmcres_cpu_state *state;
 	unsigned long flags;
+	int current_cpu;
 
-	raw_spin_lock_irqsave(&state->lock, flags);
-	TRACE_TASK(tsk, "suspends at %llu\n", litmus_clock());
+	TRACE_TASK(tsk, "blocked at %llu\n", litmus_clock());
+
+	raw_spin_lock_irqsave(&tinfo->lock, flags);
+
+	// We need to unschedule the task from the current CPU
+	state = local_cpu_state();
+	raw_spin_lock(&state->lock);
+	current_cpu = state->cpu;
 	WARN_ON(state->scheduled != tsk);
-	state->scheduled = NULL;
-	raw_spin_unlock_irqrestore(&state->lock, flags);
+	if (state->scheduled == tsk)
+		state->scheduled = NULL;
+	if (state->linked == tsk)
+		state->linked = NULL;
+	raw_spin_unlock(&state->lock);
+
+	// If the task had already made a request for another CPU, we need to
+	// cancel it.
+	if (litmus_clock() >=
+	    tinfo->major_cycle_start + tinfo->gtdinterval->start) {
+		int expected_cpu = tinfo->gtdinterval->cpu;
+		if (current_cpu != expected_cpu) {
+			TRACE_TASK(
+				tsk,
+				"must be unscheduled/unrequested from CPU %d\n",
+				expected_cpu);
+			state = cpu_state_for(expected_cpu);
+			raw_spin_lock(&state->lock);
+			if (state->linked == tsk) {
+				state->linked = NULL;
+				litmus_reschedule(expected_cpu);
+			}
+			raw_spin_unlock(&state->lock);
+		}
+	}
+
+	raw_spin_unlock_irqrestore(&tinfo->lock, flags);
 }
 
 static void gmcres_task_wake_up(struct task_struct *tsk)
 {
 	struct gmcres_task_state *tinfo = get_gmcres_task_state(tsk);
-	struct gtd_reservation *gtdres = tinfo->gtdres;
+	struct gmcres_cpu_state *state;
 	unsigned long flags;
-	int cpu;
+	int expected_cpu;
 
-	BUG_ON(!gtdres);
-	raw_spin_lock_irqsave(&gtdres->lock, flags);
-	cpu = tinfo->cpu;
-	if (cpu != NO_CPU) {
-		BUG_ON(gtdres->task != tsk);
-		TRACE_TASK(tsk,
-			   "resumes at %llu, trying to reschedule CPU %d\n",
-			   litmus_clock(), cpu);
-		litmus_reschedule(cpu);
-	} else {
-		TRACE_TASK(
-			tsk,
-			"resuming but assigned to no CPU, no rescheduling\n");
+	TRACE_TASK(tsk, "is waking up at %llu\n", litmus_clock());
+
+	raw_spin_lock_irqsave(&tinfo->lock, flags);
+
+	// If the task is in an interval, check the CPU it would like to be scheduled on
+	expected_cpu = litmus_clock() >= tinfo->major_cycle_start +
+						 tinfo->gtdinterval->start ?
+				     tinfo->gtdinterval->cpu :
+				     NO_CPU;
+
+	// If another CPU than the current one is expected, mark the task as requested
+	// and provoke a reschedule at both places.
+	if (expected_cpu != NO_CPU) {
+		TRACE_TASK(tsk, "is requesting to be scheduled on CPU %d\n",
+			   expected_cpu);
+		state = cpu_state_for(expected_cpu);
+		raw_spin_lock(&state->lock);
+		state->linked = tsk;
+		raw_spin_unlock(&state->lock);
+		litmus_reschedule_local();
+		litmus_reschedule(expected_cpu);
 	}
-	raw_spin_unlock_irqrestore(&gtdres->lock, flags);
+
+	raw_spin_unlock_irqrestore(&tinfo->lock, flags);
 }
 
 static struct domain_proc_info gmcres_domain_proc_info;
@@ -528,9 +593,6 @@ static long gmcres_activate_plugin(void)
 		state = cpu_state_for(cpu);
 		memset(state, 0, sizeof(*state));
 		state->cpu = cpu;
-		hrtimer_init(&state->scheduling_timer, CLOCK_MONOTONIC,
-			     HRTIMER_MODE_ABS);
-		state->scheduling_timer.function = on_scheduling_timer;
 	}
 
 	gmcres_setup_domain_proc();
@@ -546,19 +608,18 @@ static long gmcres_deactivate_plugin(void)
 
 	raw_spin_lock(&gtdenv.writer_lock);
 
-	for_each_online_cpu (cpu) {
-		state = cpu_state_for(cpu);
-		raw_spin_lock(&state->lock);
-		WARN_ON(state->scheduled);
-		hrtimer_cancel(&state->scheduling_timer);
-	}
-
 	list_for_each_entry_safe (gtdres, p, &gtdenv.all_reservations,
 				  all_reservations_list) {
 		list_del(&gtdres->all_reservations_list);
 		gtd_reservation_clear(gtdres);
 		WARN_ON(gtdres->task);
 		kfree(gtdres);
+	}
+
+	for_each_online_cpu (cpu) {
+		state = cpu_state_for(cpu);
+		raw_spin_lock(&state->lock);
+		WARN_ON(state->scheduled);
 	}
 
 	for_each_online_cpu (cpu) {
