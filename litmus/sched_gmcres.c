@@ -82,7 +82,7 @@ static enum hrtimer_restart on_interval_timer(struct hrtimer *timer)
 	lt_t now, start, end;
 	unsigned long flags;
 	int previous_cpu, next_cpu;
-	bool is_inside_interval, is_running;
+	bool is_inside_interval, is_running, is_between_jobs;
 
 	raw_spin_lock_irqsave(&tinfo->lock, flags);
 	now = litmus_clock();
@@ -95,7 +95,8 @@ static enum hrtimer_restart on_interval_timer(struct hrtimer *timer)
 
 	TRACE_TASK(
 		tsk,
-		"(is_running:%d) executes on_interval_timer at %llu for interval [%llu-%llu) (cpu %d)\n",
+		"(is_running:%d) executes on_interval_timer at %llu "
+		"for interval [%llu-%llu) (cpu %d)\n",
 		is_running, now,
 		tinfo->major_cycle_start + tinfo->gtdinterval->start,
 		tinfo->major_cycle_start + tinfo->gtdinterval->end,
@@ -115,9 +116,14 @@ static enum hrtimer_restart on_interval_timer(struct hrtimer *timer)
 		"has computed new interval [%llu-%llu) (cpu %d) (is_inside_interval:%d)\n",
 		start, end, tinfo->gtdinterval->cpu, is_inside_interval);
 
+	// Check if the task is between jobs
+	is_between_jobs =
+		tsk_rt(tsk)->completed && tsk_rt(tsk)->job_params.release > now;
+
 	// Check the next CPU to use, or NO_CPU
-	next_cpu = is_inside_interval && is_running ? tinfo->gtdinterval->cpu :
-							    NO_CPU;
+	next_cpu = is_inside_interval && is_running && !is_between_jobs ?
+				 tinfo->gtdinterval->cpu :
+				 NO_CPU;
 
 	// Mark and reschedule concerned CPUs
 	state = cpu_state_for(previous_cpu);
@@ -260,6 +266,21 @@ static lt_t next_task_timer(struct gmcres_task_state *tinfo, lt_t now)
 	return tinfo->major_cycle_start + tinfo->gtdinterval->end;
 }
 
+// If required, advance interval_timer to the given deadline. This must be called
+// with interrupts disabled and the task structure locked.
+static void advance_interval_timer_at(struct task_struct *tsk, lt_t deadline)
+{
+	struct gmcres_task_state *tinfo = get_gmcres_task_state(tsk);
+	if (lt_before(deadline, ktime_to_ns(hrtimer_get_expires(
+					&tinfo->interval_timer)))) {
+		TRACE_TASK(
+			current,
+			"requires advancing timer since release is before next timer\n");
+		hrtimer_start(&tinfo->interval_timer, ns_to_ktime(deadline),
+			      HRTIMER_MODE_ABS);
+	}
+}
+
 static void gmcres_task_new(struct task_struct *tsk, int on_runqueue,
 			    int is_running)
 {
@@ -291,15 +312,16 @@ static void gmcres_task_new(struct task_struct *tsk, int on_runqueue,
 		   "is a new RT task at %llu (on runqueue:%d, running:%d)\n",
 		   now, on_runqueue, is_running);
 
-	// Setup job parameters
-	release_at(tsk, now);
+	// Setup job parameters by aligning the release time to the next occurrence of the
+	// task period.
+	release_at(tsk, now - (now % get_rt_period(tsk)));
 
 	// Compute the wanted CPU or NO_CPU
 	wanted_cpu = is_inside_interval ? tinfo->gtdinterval->cpu : NO_CPU;
 
 	if (is_running) {
 		// Register the task as running on the current CPU. Insist on
-		// staying there if this is the right CPU.
+		// staying there if this is the right CPU, else reschedule.
 		struct gmcres_cpu_state *state = local_cpu_state();
 		raw_spin_lock(&state->lock);
 		current_cpu = state->cpu;
@@ -307,8 +329,15 @@ static void gmcres_task_new(struct task_struct *tsk, int on_runqueue,
 		state->scheduled = tsk;
 		TRACE_TASK(tsk, "registered as currently running here\n");
 		if (current_cpu == wanted_cpu) {
-			TRACE_TASK(tsk, "is currently on the CPU it wants\n");
+			TRACE_TASK(
+				tsk,
+				"is currently running on the CPU it wants\n");
 			state->linked = tsk;
+		} else {
+			TRACE_TASK(tsk,
+				   "will ask to get descheduled from CPU %d\n",
+				   current_cpu);
+			litmus_reschedule_local();
 		}
 		raw_spin_unlock(&state->lock);
 
@@ -323,7 +352,6 @@ static void gmcres_task_new(struct task_struct *tsk, int on_runqueue,
 			TRACE_TASK(tsk, "is requesting to run on CPU %d\n",
 				   wanted_cpu);
 			raw_spin_unlock(&state->lock);
-			litmus_reschedule_local();
 			litmus_reschedule(wanted_cpu);
 		}
 	}
@@ -634,6 +662,47 @@ static long gmcres_deactivate_plugin(void)
 	return 0;
 }
 
+long gmcres_complete_job(void)
+{
+	struct gmcres_task_state *tinfo = get_gmcres_task_state(current);
+	struct rt_param *rt_param = tsk_rt(current);
+	lt_t now;
+	unsigned long flags;
+
+	raw_spin_lock_irqsave(&tinfo->lock, flags);
+
+	prepare_for_next_period(current);
+	now = litmus_clock();
+	TRACE_TASK(current,
+		   "has completed its job at %llu - "
+		   "next release will be %llu, deadline will be %llu\n",
+		   now, rt_param->job_params.release,
+		   rt_param->job_params.deadline);
+	if (rt_param->job_params.release >= now) {
+		struct gmcres_cpu_state *state = local_cpu_state();
+		advance_interval_timer_at(current,
+					  rt_param->job_params.release);
+		raw_spin_lock(&state->lock);
+		WARN_ON(state->scheduled != current);
+		if (state->linked == current)
+			state->linked = NULL;
+		raw_spin_unlock(&state->lock);
+		TRACE_TASK(current, "will ask CPU %d to deschedule it\n",
+			   state->cpu);
+		litmus_reschedule_local();
+		rt_param->completed = 1;
+	} else {
+		TRACE_TASK(
+			current,
+			"at %llu is already past its next release date %llu\n",
+			now, rt_param->job_params.release);
+	}
+
+	raw_spin_unlock_irqrestore(&tinfo->lock, flags);
+
+	return 0;
+}
+
 static struct sched_plugin gmcres_plugin = {
 	.plugin_name = "G-MCRES",
 	.schedule = gmcres_schedule,
@@ -643,7 +712,7 @@ static struct sched_plugin gmcres_plugin = {
 	.fork_task = gmcres_fork_task,
 	.task_block = gmcres_task_block,
 	.task_wake_up = gmcres_task_wake_up,
-	.complete_job = complete_job_oneshot,
+	.complete_job = gmcres_complete_job,
 	.get_domain_proc_info = gmcres_get_domain_proc_info,
 	.activate_plugin = gmcres_activate_plugin,
 	.deactivate_plugin = gmcres_deactivate_plugin,
