@@ -10,9 +10,7 @@
 #include <litmus/reservations/table-driven.h>
 
 struct gtd_reservation {
-	// Extend basic reservation which serves as reference
-	struct reservation res;
-
+	unsigned int id;
 	lt_t major_cycle;
 	lt_t period;
 	struct list_head intervals;
@@ -38,10 +36,6 @@ struct gtd_interval {
 
 // Time not available (for example, when no interval is defined)
 #define GTDRES_TIME_NA ((lt_t)~0)
-
-// Initialize the global reservation. The res field is initialized with its default
-// value.
-long gtd_reservation_init(struct gtd_reservation *gtdres, lt_t major_cycle);
 
 // Add an interval to an existing global reservation. Locking must be used to ensure that no
 // two threads can add intervals at the same time.

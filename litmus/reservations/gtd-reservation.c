@@ -7,13 +7,14 @@
 #include <litmus/reservations/gtd-reservation.h>
 #include <litmus/reservations/reservation.h>
 
-long gtd_reservation_init(struct gtd_reservation *gtdres, lt_t major_cycle)
+static long gtd_reservation_init(unsigned int id,
+				 struct gtd_reservation *gtdres,
+				 lt_t major_cycle)
 {
 	memset(gtdres, 0, sizeof(*gtdres));
 	INIT_LIST_HEAD(&gtdres->intervals);
-	gtdres->major_cycle = major_cycle;
+	gtdres->id = id, gtdres->major_cycle = major_cycle;
 	raw_spin_lock_init(&gtdres->lock);
-	reservation_init(&gtdres->res);
 	return 0;
 }
 
@@ -104,7 +105,7 @@ long gtd_reservation_mark_end_of_periods(struct gtd_reservation *gtdres,
 			if (start_period != end_period) {
 				TRACE("Reservation %u: interval [%llu-%llu] (on cpu %u) crosses"
 				      "a period (%llu) boundary\n",
-				      gtdres->res.id, interval->start,
+				      gtdres->id, interval->start,
 				      interval->end, interval->cpu, period);
 				return -EINVAL;
 			}
@@ -127,7 +128,7 @@ long gtd_reservation_mark_end_of_periods(struct gtd_reservation *gtdres,
 	return 0;
 error_no_interval:
 	TRACE("Reservation %u: period [%llu-%llu) contains no interval for task execution\n",
-	      gtdres->res.id, period * (prev_period - 1), period * prev_period);
+	      gtdres->id, period * (prev_period - 1), period * prev_period);
 	return -EINVAL;
 }
 
@@ -142,7 +143,7 @@ struct gtd_reservation *gtd_env_find(struct gtd_env *gtdenv, unsigned int id)
 	struct gtd_reservation *res;
 	list_for_each_entry (res, &gtdenv->all_reservations,
 			     all_reservations_list)
-		if (res->res.id == id)
+		if (res->id == id)
 			return res;
 	return NULL;
 }
@@ -156,7 +157,7 @@ long gtd_env_find_or_create(struct gtd_env *gtdenv,
 	*gtdres = NULL;
 	list_for_each_entry (res, &gtdenv->all_reservations,
 			     all_reservations_list)
-		if (res->res.id == config->id) {
+		if (res->id == config->id) {
 			if (res->major_cycle !=
 			    config->table_driven_params.major_cycle_length) {
 				TRACE("Reservation %u major cycle period mismatch (%llu != %llu)\n",
@@ -172,9 +173,7 @@ long gtd_env_find_or_create(struct gtd_env *gtdenv,
 	res = kzalloc(sizeof(*res), GFP_KERNEL);
 	if (res == NULL)
 		return -ENOMEM;
-	gtd_reservation_init(res, major_cycle);
-	reservation_init(&res->res);
-	res->res.id = config->id;
+	gtd_reservation_init(config->id, res, major_cycle);
 
 	// Add it at the end of the reservations list
 	list_add_tail(&res->all_reservations_list, &gtdenv->all_reservations);
