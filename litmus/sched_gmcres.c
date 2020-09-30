@@ -93,14 +93,13 @@ static enum hrtimer_restart on_interval_timer(struct hrtimer *timer)
 	// Remember the previous CPU this task could have been scheduled on
 	previous_cpu = tinfo->gtdinterval->cpu;
 
-	TRACE_TASK(
-		tsk,
-		"(is_running:%d) executes on_interval_timer at %llu "
-		"for interval [%llu-%llu) (cpu %d)\n",
-		is_running, now,
-		tinfo->major_cycle_start + tinfo->gtdinterval->start,
-		tinfo->major_cycle_start + tinfo->gtdinterval->end,
-		previous_cpu);
+	TRACE_TASK(tsk,
+		   "(is_running:%d) executes on_interval_timer at %llu "
+		   "for interval [%llu-%llu) (cpu %d)\n",
+		   is_running, now,
+		   tinfo->major_cycle_start + tinfo->gtdinterval->start,
+		   tinfo->major_cycle_start + tinfo->gtdinterval->end,
+		   previous_cpu);
 
 	// Advance intervals as much as needed and compute start, end, is_inside_interval
 	while ((end = tinfo->major_cycle_start + tinfo->gtdinterval->end) <=
@@ -476,7 +475,14 @@ static bool gmcres_should_wait_for_stack(struct task_struct *next)
 
 	raw_spin_lock_irqsave(&state->lock, flags);
 	TRACE_TASK(next, "cannot be acquired now at %llu\n", litmus_clock());
-	if (state->prev_was_realtime) {
+	if (state->linked != next) {
+		raw_spin_unlock_irqrestore(&state->lock, flags);
+		TRACE_TASK(
+			next,
+			"should no longer scheduled on CPU %d anyway, giving up\n",
+			state->cpu);
+		return false;
+	} else if (state->prev_was_realtime) {
 		state->scheduled = NULL;
 		raw_spin_unlock_irqrestore(&state->lock, flags);
 		TRACE_TASK(next, "relinguished for now to avoid deadlock\n");
