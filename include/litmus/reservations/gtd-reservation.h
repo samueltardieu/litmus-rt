@@ -13,7 +13,10 @@ struct gtd_reservation {
 	unsigned int id;
 	lt_t major_cycle;
 	lt_t period;
-	struct list_head intervals;
+	unsigned int criticality_level;
+
+	// All intervals, starting at criticality mode 0
+	struct list_head interval_sets;
 
 	// For inclusion in the list of all reservations
 	struct list_head all_reservations_list;
@@ -26,19 +29,31 @@ struct gtd_reservation {
 	struct task_struct *task;
 };
 
+struct gtd_interval_set {
+	unsigned int criticality_mode;
+	struct list_head intervals;
+
+	// For inclusion in the reservation interval_sets
+	struct list_head list;
+};
+
+// An interval relative to the major cycle frame
 struct gtd_interval {
 	struct list_head list;
 	lt_t start;
 	lt_t end;
 	int cpu;
 	bool terminates_period;
+	bool terminates_major_cycle;
 };
 
 // Time not available (for example, when no interval is defined)
 #define GTDRES_TIME_NA ((lt_t)~0)
 
 // Add an interval to an existing global reservation. Locking must be used to ensure that no
-// two threads can add intervals at the same time.
+// two threads can add intervals at the same time. The interval will be placed in the right
+// criticality mode depending on its start and end times, and will start a new criticality mode
+// if needed.
 long gtd_reservation_add_interval(struct gtd_reservation *gtdres, lt_t start,
 				  lt_t end, int cpu);
 
@@ -52,19 +67,16 @@ void gtd_reservation_clear(struct gtd_reservation *gtdres);
 long gtd_reservation_mark_end_of_periods(struct gtd_reservation *gtdres,
 					 lt_t period);
 
-typedef bool (*gtd_interval_filter_t)(struct gtd_interval *gtdinterval,
-				      void *opaque);
-
 // Find the interval englobing time or following time (with wraparound) wich
 // matches the filter. A NULL filter matches everything. Set gtdinterval
 // and major_cycle_start to the right values.
 // Return true if an interval containing time is found, false if an interval
 // following is time is found or if no interval matches. In the later case,
 // gtdinterval is set to NULL and major_cycle_start to GTDRES_TIME_NA.
-bool gtd_reservation_find_interval(struct gtd_reservation *gtdres, lt_t time,
+bool gtd_reservation_find_interval(struct gtd_reservation *gtdres,
+				   unsigned int criticality_mode, lt_t time,
 				   struct gtd_interval **gtdinterval,
-				   lt_t *major_cycle_start,
-				   gtd_interval_filter_t filter, void *opaque);
+				   lt_t *major_cycle_start);
 
 // Return the next interval in the reservation. major_cycle_start is incremented
 // by the major cycle if the intervals wrap around.
@@ -95,16 +107,5 @@ struct gtd_reservation *gtd_env_find(struct gtd_env *gtdenv, unsigned int id);
 long gtd_env_find_or_create(struct gtd_env *gtdenv,
 			    struct reservation_config *config,
 			    struct gtd_reservation **gtdres);
-
-// Find the current or next interval for time on cpu and fill the gtdres pointer. It also
-// also set gtdinterval to the corresponding interval, and major_cycle_start to the date
-// of the major cycle to add to the interval.
-// Return true if the interval includes time, or false if it is in the future. In the later case,
-// gtdres and gtdinterval will be NULL and major_cycle_start equal to GTDRES_TIME_NA if we do not
-// have any interval planned in the future.
-bool gtd_env_find_interval(struct gtd_env *gtdenv, lt_t time, int cpu,
-			   struct gtd_reservation **gtdres,
-			   struct gtd_interval **gtdinterval,
-			   lt_t *major_cycle_start);
 
 #endif // LITMUS_GTD_RESERVATION_H

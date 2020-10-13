@@ -60,6 +60,9 @@ struct gmcres_task_state {
 	struct hrtimer interval_timer;
 };
 
+// The current criticality mode
+static atomic_t criticality_mode;
+
 static struct gmcres_task_state *get_gmcres_task_state(struct task_struct *tsk)
 {
 	return tsk_rt(tsk)->plugin_state;
@@ -292,8 +295,8 @@ static void gmcres_task_new(struct task_struct *tsk, int on_runqueue,
 	raw_spin_lock_irqsave(&tinfo->lock, flags);
 	now = litmus_clock();
 	is_inside_interval = gtd_reservation_find_interval(
-		tinfo->gtdres, now, &tinfo->gtdinterval,
-		&tinfo->major_cycle_start, NULL, NULL);
+		tinfo->gtdres, atomic_read(&criticality_mode), now,
+		&tinfo->gtdinterval, &tinfo->major_cycle_start);
 	BUG_ON(!tinfo->gtdinterval);
 	TRACE_TASK(
 		tsk,
@@ -618,6 +621,8 @@ static long gmcres_activate_plugin(void)
 {
 	int cpu;
 	struct gmcres_cpu_state *state;
+
+	atomic_set(&criticality_mode, 0);
 
 	gtd_env_init(&gtdenv);
 
