@@ -141,17 +141,25 @@ static enum hrtimer_restart on_interval_timer(struct hrtimer *timer)
 		state->linked = NULL;
 		litmus_reschedule(previous_cpu);
 	}
-	// Note: if we have state->linked != tsk and state->scheduled == tsk,
+	// If we have state->linked != tsk and state->scheduled == tsk,
 	// then another task has requested a rescheduling in order to satisfy
 	// its recent "linked" requirement, no need to schedule an extra one.
 	raw_spin_unlock(&state->lock);
 
 	if (next_cpu != previous_cpu && next_cpu != NO_CPU) {
+		int needs_reschedule;
 		state = cpu_state_for(next_cpu);
 		raw_spin_lock(&state->lock);
+		// We needs to reschedule the target CPU unless some other task is
+		// scheduled there and has asked to be descheduled by setting
+		// state->linked to NULL, in which case the reschedule will happen
+		// anyway and the current task will be scheduled spontaneously once
+		// state->linked is set and the lock is released.
+		needs_reschedule = !(state->scheduled && !state->linked);
 		TRACE_TASK(tsk, "requesting scheduling on CPU %d\n", next_cpu);
 		state->linked = tsk;
-		litmus_reschedule(next_cpu);
+		if (needs_reschedule)
+			litmus_reschedule(next_cpu);
 		raw_spin_unlock(&state->lock);
 	}
 	raw_spin_unlock_irqrestore(&tinfo->lock, flags);
