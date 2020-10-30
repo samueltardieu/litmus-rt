@@ -147,17 +147,18 @@ long gtd_reservation_mark_end_of_periods(struct gtd_reservation *gtdres,
 {
 	struct gtd_interval_set *set;
 	struct gtd_interval *interval;
-	lt_t prev_period;
+	lt_t prev_period_num;
 	unsigned int criticality_mode = 0;
 
 	list_for_each_entry (set, &gtdres->interval_sets, list) {
 		BUG_ON(set->criticality_mode != criticality_mode);
-		prev_period = gtdres->major_cycle;
+		prev_period_num = period ? gtdres->major_cycle / period : 0;
 		list_for_each_entry_reverse (interval, &set->intervals, list) {
 			if (period) {
-				lt_t start_period = interval->start / period;
-				lt_t end_period = interval->end / period;
-				if (start_period != end_period) {
+				lt_t start_period_num =
+					interval->start / period;
+				lt_t end_period_num = interval->end / period;
+				if (start_period_num != end_period_num) {
 					TRACE("Reservation %u: interval [%llu-%llu] (on cpu %u) "
 					      "crosses a period (%llu) boundary "
 					      "at criticality mode %u\n",
@@ -166,21 +167,14 @@ long gtd_reservation_mark_end_of_periods(struct gtd_reservation *gtdres,
 					      period, criticality_mode);
 					return -EINVAL;
 				}
-				if (start_period == prev_period)
-					interval->terminates_period = true;
-				else if (start_period + 1 == prev_period) {
-					interval->terminates_period = false;
-					prev_period = start_period;
-				} else
-					goto error_no_interval;
 				interval->terminates_period =
-					start_period != prev_period;
-				prev_period = start_period;
+					start_period_num != prev_period_num;
+				prev_period_num = start_period_num;
 			} else {
 				interval->terminates_period = false;
 			}
 		}
-		if (prev_period != 0)
+		if (prev_period_num != 0)
 			goto error_no_interval;
 		criticality_mode++;
 	}
@@ -189,8 +183,8 @@ long gtd_reservation_mark_end_of_periods(struct gtd_reservation *gtdres,
 error_no_interval:
 	TRACE("Reservation %u: period [%llu-%llu) at criticality mode %u "
 	      "contains no interval for task execution\n",
-	      gtdres->id, period * (prev_period - 1), period * prev_period,
-	      criticality_mode);
+	      gtdres->id, period * (prev_period_num - 1),
+	      period * prev_period_num, criticality_mode);
 	return -EINVAL;
 }
 
