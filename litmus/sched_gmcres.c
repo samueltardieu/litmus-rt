@@ -416,7 +416,7 @@ static void gmcres_task_exit(struct task_struct *tsk)
 static long gmcres_reservation_create(int res_type, void *__user _config)
 {
 	struct reservation_config config;
-	struct gtd_reservation *res;
+	struct gtd_reservation *gtdres;
 	struct lt_interval interval;
 	long ret;
 	unsigned int i;
@@ -436,7 +436,7 @@ static long gmcres_reservation_create(int res_type, void *__user _config)
 	}
 
 	raw_spin_lock(&gtdenv.writer_lock);
-	ret = gtd_env_find_or_create(&gtdenv, &config, &res);
+	ret = gtd_env_find_or_create(&gtdenv, &config, &gtdres);
 	if (ret < 0) {
 		TRACE("Cannot create reservation %u\n", config.id);
 		goto error_with_unlock;
@@ -450,7 +450,7 @@ static long gmcres_reservation_create(int res_type, void *__user _config)
 			     sizeof(interval)))) {
 			goto error_with_unlock;
 		}
-		ret = gtd_reservation_add_interval(res, interval.start,
+		ret = gtd_reservation_add_interval(gtdres, interval.start,
 						   interval.end, config.cpu);
 		if (ret < 0) {
 			TRACE("Cannot add interval [%llu-%llu] on CPU %d\n",
@@ -458,6 +458,14 @@ static long gmcres_reservation_create(int res_type, void *__user _config)
 			goto error_with_unlock;
 		}
 	}
+
+	// Update the maximum criticality level if needed
+	if (gtdres->criticality_level > gtdenv.maximum_criticality_level) {
+		TRACE("Maximum criticality level is set to %u\n",
+		      gtdres->criticality_level);
+		gtdenv.maximum_criticality_level = gtdres->criticality_level;
+	}
+
 	raw_spin_unlock(&gtdenv.writer_lock);
 
 	return 0;

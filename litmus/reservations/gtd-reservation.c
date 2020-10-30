@@ -198,6 +198,7 @@ void gtd_env_init(struct gtd_env *gtdenv)
 {
 	INIT_LIST_HEAD(&gtdenv->all_reservations);
 	raw_spin_lock_init(&gtdenv->writer_lock);
+	gtdenv->maximum_criticality_level = 0;
 }
 
 struct gtd_reservation *gtd_env_find(struct gtd_env *gtdenv, unsigned int id)

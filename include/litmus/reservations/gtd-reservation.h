@@ -87,12 +87,16 @@ gtd_reservation_next_interval(const struct gtd_reservation *gtdres,
 
 // Environment for holding known reservations
 struct gtd_env {
-	// All reservations
-	struct list_head all_reservations;
-
 	// Global writer lock that must be held when creating a reservation or adding intervals to
 	// an existing reservation
 	raw_spinlock_t writer_lock;
+
+	// All reservations
+	struct list_head all_reservations;
+
+	// Maximum criticality level of any existing reservation, must be updated when adding
+	// intervals to reservations if this causes this level to raise.
+	unsigned int maximum_criticality_level;
 };
 
 void gtd_env_init(struct gtd_env *gtdenv);
