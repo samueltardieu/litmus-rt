@@ -73,6 +73,10 @@ static atomic_t system_criticality_mode;
 // The number of mode changes in progress
 static atomic_t access_counter;
 
+// The maximum criticality level of any existing task currently admitted
+// by the plugin.
+static atomic_t maximum_criticality_level;
+
 static struct gmcres_task_state *get_gmcres_task_state(struct task_struct *tsk)
 {
 	return tsk_rt(tsk)->plugin_state;
@@ -134,25 +138,38 @@ static lt_t task_scheduling_decision(struct task_struct *tsk)
 			tinfo->criticality_mode,
 			tinfo->gtdres->criticality_level,
 			atomic_read(&system_criticality_mode),
-			gtdenv.maximum_criticality_level);
+			atomic_read(&maximum_criticality_level));
 
-		// Use the last CPU we were schedule on to trigger the mode change
-		state = cpu_state_for(previous_cpu);
-		raw_spin_lock(&state->lock);
-		if (state->criticality_mode < tinfo->criticality_mode + 1) {
-			state->criticality_mode = tinfo->criticality_mode + 1;
-			litmus_reschedule(previous_cpu);
+		// Only increase criticality mode if we have at least one task ready
+		// to execute at this mode.
+		if (tinfo->criticality_mode <
+		    atomic_read(&maximum_criticality_level)) {
+			// Use the last CPU we were scheduled on to trigger the mode change
+			state = cpu_state_for(previous_cpu);
+			raw_spin_lock(&state->lock);
+			if (state->criticality_mode <
+			    tinfo->criticality_mode + 1) {
+				state->criticality_mode =
+					tinfo->criticality_mode + 1;
+				litmus_reschedule(previous_cpu);
+				TRACE_TASK(
+					tsk,
+					"used CPU %d to trigger criticality mode increase to %u\n",
+					previous_cpu,
+					tinfo->criticality_mode + 1);
+			}
+			raw_spin_unlock(&state->lock);
+
+			// Do not set a new timer right now, the mode change will take effect
+			// as soon as the scheduling takes place and a new interval will be
+			// computed.
+			return GTDRES_TIME_NA;
+		} else
 			TRACE_TASK(
 				tsk,
-				"used CPU %d to trigger criticality mode increase to %u\n",
-				previous_cpu, tinfo->criticality_mode + 1);
-		}
-		raw_spin_unlock(&state->lock);
-
-		// Do not set a new timer right now, the mode change will take effect
-		// as soon as the scheduling takes place and a new interval will be
-		// computed.
-		return GTDRES_TIME_NA;
+				"cannot increase criticality mode as there would be "
+				"no tasks to execute in criticality mode %u\n",
+				tinfo->criticality_mode + 1);
 	}
 
 	// If the task has been released, release it (mark it as not completed)
@@ -477,6 +494,16 @@ static long gmcres_admit_task(struct task_struct *tsk)
 	// The budget enforcement will be done on interval boundaries only
 	tsk_rt(tsk)->task_params.budget_policy = NO_ENFORCEMENT;
 
+	// Update the maximum criticality level of admitted tasks
+	while (true) {
+		unsigned int mcl = atomic_read(&maximum_criticality_level);
+		if (mcl >= gtdres->criticality_level)
+			break;
+		if (atomic_cmpxchg(&maximum_criticality_level, mcl,
+				   gtdres->criticality_level) == mcl)
+			break;
+	}
+
 	gtdres->task = tsk;
 
 unlock_and_return:
@@ -598,6 +625,7 @@ static void gmcres_task_exit(struct task_struct *tsk)
 	struct gmcres_task_state *tinfo = get_gmcres_task_state(tsk);
 	int cpu;
 	unsigned long flags;
+	unsigned int tcl;
 
 	TRACE_TASK(tsk, "exiting at %llu\n", litmus_clock());
 
@@ -611,7 +639,16 @@ static void gmcres_task_exit(struct task_struct *tsk)
 	raw_spin_lock_irqsave(&tinfo->gtdres->lock, flags);
 	BUG_ON(tinfo->gtdres->task != tsk);
 	tinfo->gtdres->task = NULL;
+	tcl = tinfo->gtdres->criticality_level;
 	raw_spin_unlock(&tinfo->gtdres->lock);
+
+	// If the exiting task had the maximum criticality level and it was
+	// not 0, update the maximum criticality level since it might have
+	// gone down.
+	if (tcl == atomic_read(&maximum_criticality_level) && tcl > 0) {
+		atomic_set(&maximum_criticality_level,
+			   gtd_env_maximum_task_criticality_level(&gtdenv));
+	}
 
 	// If the task is scheduled on any CPU, deschedule it and deschedule requests.
 	for_each_online_cpu (cpu) {
@@ -682,13 +719,6 @@ static long gmcres_reservation_create(int res_type, void *__user _config)
 			      interval.start, interval.end, config.cpu);
 			goto error_with_unlock;
 		}
-	}
-
-	// Update the maximum criticality level if needed
-	if (gtdres->criticality_level > gtdenv.maximum_criticality_level) {
-		TRACE("Maximum criticality level is set to %u\n",
-		      gtdres->criticality_level);
-		gtdenv.maximum_criticality_level = gtdres->criticality_level;
 	}
 
 	raw_spin_unlock(&gtdenv.writer_lock);
@@ -865,6 +895,7 @@ static long gmcres_activate_plugin(void)
 
 	atomic_set(&system_criticality_mode, 0);
 	atomic_set(&access_counter, 0);
+	atomic_set(&maximum_criticality_level, 0);
 
 	gtd_env_init(&gtdenv);
 

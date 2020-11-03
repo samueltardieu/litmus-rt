@@ -93,10 +93,6 @@ struct gtd_env {
 
 	// All reservations
 	struct list_head all_reservations;
-
-	// Maximum criticality level of any existing reservation, must be updated when adding
-	// intervals to reservations if this causes this level to raise.
-	unsigned int maximum_criticality_level;
 };
 
 void gtd_env_init(struct gtd_env *gtdenv);
@@ -111,5 +107,9 @@ struct gtd_reservation *gtd_env_find(struct gtd_env *gtdenv, unsigned int id);
 long gtd_env_find_or_create(struct gtd_env *gtdenv,
 			    struct reservation_config *config,
 			    struct gtd_reservation **gtdres);
+
+// Compute the maximum criticality level of reservations bound to tasks. This function will in
+// turn lock all reservations, so no reservation lock must be held while calling it.
+unsigned int gtd_env_maximum_task_criticality_level(struct gtd_env *gtdenv);
 
 #endif // LITMUS_GTD_RESERVATION_H

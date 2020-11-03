@@ -192,7 +192,6 @@ void gtd_env_init(struct gtd_env *gtdenv)
 {
 	INIT_LIST_HEAD(&gtdenv->all_reservations);
 	raw_spin_lock_init(&gtdenv->writer_lock);
-	gtdenv->maximum_criticality_level = 0;
 }
 
 struct gtd_reservation *gtd_env_find(struct gtd_env *gtdenv, unsigned int id)
@@ -301,4 +300,20 @@ gtd_reservation_next_interval(const struct gtd_reservation *gtdres,
 		*major_cycle_start += gtdres->major_cycle;
 	}
 	return container_of(next_interval, struct gtd_interval, list);
+}
+
+unsigned int gtd_env_maximum_task_criticality_level(struct gtd_env *gtdenv)
+{
+	struct gtd_reservation *gtdres;
+	unsigned int maximum_criticality_level = 0;
+	list_for_each_entry (gtdres, &gtdenv->all_reservations,
+			     all_reservations_list) {
+		unsigned long flags;
+		raw_spin_lock_irqsave(&gtdres->lock, flags);
+		if (gtdres->task &&
+		    gtdres->criticality_level > maximum_criticality_level)
+			maximum_criticality_level = gtdres->criticality_level;
+		raw_spin_unlock_irqrestore(&gtdres->lock, flags);
+	}
+	return maximum_criticality_level;
 }
