@@ -120,7 +120,7 @@ static lt_t task_scheduling_decision(struct task_struct *tsk)
 	past_current_interval = now > tinfo->gtdinterval->end;
 
 	TRACE_TASK(tsk,
-		   "(is_running:%d - completed:%d - is_between_jobs:%d) "
+		   "(is_running:%d - completed:%d) "
 		   "executes on_interval_timer at %llu "
 		   "for interval [%llu-%llu) (cpu %d) (is-last-of-period:%d)\n",
 		   is_running, is_completed(tsk), now,

@@ -150,6 +150,10 @@ long gtd_reservation_mark_end_of_periods(struct gtd_reservation *gtdres,
 	lt_t prev_period_num;
 	unsigned int criticality_mode = 0;
 
+	// Remember period in case new intervals are added while a task is
+	// attached to the reservation.
+	gtdres->period = period;
+
 	list_for_each_entry (set, &gtdres->interval_sets, list) {
 		BUG_ON(set->criticality_mode != criticality_mode);
 		prev_period_num = period ? gtdres->major_cycle / period : 0;
@@ -186,6 +190,30 @@ error_no_interval:
 	      gtdres->id, period * (prev_period_num - 1),
 	      period * prev_period_num, criticality_mode);
 	return -EINVAL;
+}
+
+void gtd_reservation_dump(struct gtd_reservation *gtdres)
+{
+	struct gtd_interval_set *set;
+	TRACE("Content of reservation %d (major-cycle:%llu, period:%llu, criticality-level:%u)\n",
+	      gtdres->id, gtdres->major_cycle, gtdres->period,
+	      gtdres->criticality_level);
+	if (gtdres->task)
+		TRACE("Task with PID %lu is attached to the reservation\n",
+		      gtdres->task->pid);
+	else
+		TRACE("No task attached to the reservation\n");
+	list_for_each_entry (set, &gtdres->interval_sets, list) {
+		struct gtd_interval *interval;
+		TRACE("Intervals for criticality mode %u:\n",
+		      set->criticality_mode);
+		list_for_each_entry (interval, &set->intervals, list)
+			TRACE("  - [%llu-%llu) (cpu:%u, terminates-period:%u, "
+			      "terminates-major-cycle:%u)\n",
+			      interval->start, interval->end, interval->cpu,
+			      interval->terminates_period,
+			      interval->terminates_major_cycle);
+	}
 }
 
 void gtd_env_init(struct gtd_env *gtdenv)
