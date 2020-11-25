@@ -542,7 +542,7 @@ static void gmcres_task_new(struct task_struct *tsk, int on_runqueue,
 			    int is_running)
 {
 	struct gmcres_task_state *tinfo = get_gmcres_task_state(tsk);
-	lt_t now, next_timer;
+	lt_t now, next_timer, release_time;
 	unsigned long flags;
 	bool is_inside_interval;
 	int wanted_cpu, current_cpu;
@@ -576,7 +576,11 @@ static void gmcres_task_new(struct task_struct *tsk, int on_runqueue,
 
 	// Setup job parameters by aligning the release time to the next occurrence of the
 	// task period.
-	release_at(tsk, now - (now % get_rt_period(tsk)));
+	release_time = now + get_rt_period(tsk) - (now % get_rt_period(tsk));
+	release_at(tsk, release_time);
+	tsk_rt(tsk)->completed = 1;
+	TRACE_TASK(tsk, "will be first released at %llu (now is %llu)\n",
+		   release_time, now);
 
 	// Compute the wanted CPU or NO_CPU
 	wanted_cpu = is_inside_interval ? tinfo->gtdinterval->cpu : NO_CPU;
