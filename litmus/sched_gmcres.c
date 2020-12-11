@@ -53,18 +53,25 @@ struct gmcres_task_state {
 	raw_spinlock_t lock;
 
 	// The reservation associated to this task, cannot be NULL once the task
-	// has been admitted, and contains the reserve link to the struct task_struct * entry.
+	// has been admitted, and contains the reverse link to the struct task_struct * entry.
 	struct gtd_reservation *gtdres;
 
-	// The current interval, cannot be NULL once the task has been started, and
-	// the associated major cycle start time and criticality mode.
+	// The current or next interval if outside an interval. NULL means that the task
+	// is being removed from the gmcres scheduler alltogether, or that the task is waiting
+	// for a criticality mode change to happen. In this case, the event_timer is not armed
+	// either.
 	struct gtd_interval *gtdinterval;
+
+	// The task major cycle start for the interval defined above.
 	lt_t major_cycle_start;
+
+	// The criticality mode corresponding to the latest non-NULL interval defined above.
 	unsigned criticality_mode;
 
-	// The timer associated with beginning or end of intervals, is always
-	// armed when the task has been admitted.
-	struct hrtimer interval_timer;
+	// The timer associated with task events, such as the beginning or end
+	// of an interval, or a task release time. It can only be armed if an
+	// interval is defined.
+	struct hrtimer event_timer;
 };
 
 // The current criticality mode
@@ -93,7 +100,8 @@ static struct gmcres_task_state *get_gmcres_task_state(struct task_struct *tsk)
 // Take the next task scheduling decision and return the time at which the
 // decision should be reconsidered. This function must be called with the
 // gmcres_task_state lock held and IRQ disabled. Returning GTDRES_TIME_NA
-// means that we do not want a timer to be set.
+// means that we do not want a timer to be set. If there is no interval,
+// GTDRES_TIME_NA is returned.
 static lt_t task_scheduling_decision(struct task_struct *tsk)
 {
 	struct gmcres_task_state *tinfo = get_gmcres_task_state(tsk);
@@ -106,6 +114,9 @@ static lt_t task_scheduling_decision(struct task_struct *tsk)
 
 	now = litmus_clock();
 	scm = atomic_read(&system_criticality_mode);
+
+	if (!tinfo->gtdinterval)
+		return GTDRES_TIME_NA;
 
 	// Is the task currently running?
 	is_running = tsk->state == TASK_RUNNING;
@@ -163,7 +174,7 @@ static lt_t task_scheduling_decision(struct task_struct *tsk)
 			// Do not set a new timer right now, the mode change will take effect
 			// as soon as the scheduling takes place and a new interval will be
 			// computed.
-			return GTDRES_TIME_NA;
+			tinfo->gtdinterval = NULL;
 		} else
 			TRACE_TASK(
 				tsk,
@@ -283,22 +294,28 @@ static lt_t task_scheduling_decision(struct task_struct *tsk)
 }
 
 // Act on interval timer
-static enum hrtimer_restart on_interval_timer(struct hrtimer *timer)
+static enum hrtimer_restart on_event_timer(struct hrtimer *timer)
 {
 	struct gmcres_task_state *tinfo =
-		container_of(timer, struct gmcres_task_state, interval_timer);
+		container_of(timer, struct gmcres_task_state, event_timer);
 	struct task_struct *tsk = tinfo->gtdres->task;
 	lt_t next_timer;
+
+	// Sanity check
+	WARN_ON(!tinfo->gtdinterval);
 
 	// hrtimer handlers are called from a IRQ handler, so IRQ are already disabled
 	raw_spin_lock(&tinfo->lock);
 	next_timer = task_scheduling_decision(tsk);
 	if (next_timer != GTDRES_TIME_NA) {
+		WARN_ON(!tinfo->gtdinterval);
 		TRACE_TASK(tsk, "next timer expiration set to %llu\n",
 			   next_timer);
 		hrtimer_set_expires(timer, ns_to_ktime(next_timer));
-	} else
+	} else {
+		WARN_ON(tinfo->gtdinterval);
 		TRACE_TASK(tsk, "no timer is set\n");
+	}
 	raw_spin_unlock(&tinfo->lock);
 
 	return next_timer == GTDRES_TIME_NA ? HRTIMER_NORESTART :
@@ -351,24 +368,39 @@ static bool ensure_minimum_criticality_mode(unsigned int target_mode)
 			lt_t next_timer;
 			raw_spin_lock(&tinfo->lock);
 			WARN_ON(tinfo->criticality_mode >= target_mode);
+			// Make the task deschedule itself from the CPU it was running on
+			next_timer = task_scheduling_decision(tsk);
+			WARN_ON(next_timer != GTDRES_TIME_NA);
+			// Increase the task criticality mode and compute the new interval
 			tinfo->criticality_mode = target_mode;
 			gtd_reservation_find_interval(
 				tinfo->gtdres, target_mode, now,
 				&tinfo->gtdinterval, &tinfo->major_cycle_start);
 			next_timer = task_scheduling_decision(tsk);
+			// If the task can be scheduled (if its criticality level is not
+			// less than the system criticality level), start a timer. Note that
+			// the side effect of calling task_scheduling_decision twice is that
+			// all CPUs implicated in both previous and new criticality modes
+			// will be rescheduling.
 			if (next_timer != GTDRES_TIME_NA) {
-				hrtimer_start(&tinfo->interval_timer,
+				hrtimer_start(&tinfo->event_timer,
 					      ns_to_ktime(next_timer),
 					      HRTIMER_MODE_ABS);
 				TRACE_TASK(tsk, "timer reset to %llu\n",
 					   next_timer);
 			} else {
-				hrtimer_cancel(&tinfo->interval_timer);
-				TRACE_TASK(tsk, "timer cancelled, task has no interval\n");
+				hrtimer_cancel(&tinfo->event_timer);
+				TRACE_TASK(
+					tsk,
+					"timer cancelled, task has no interval\n");
 				// TODO: terminate task properly by making it
 				// leave the real-time domain and receive a signal.
 				// This may be better done when descheduling the task if
 				// it is scheduled, or here otherwise.
+				// As this will call gmcres_task_exit, this must be done
+				// from a place where in a way where gtdenv->writer_lock
+				// is not held.
+				// force_sig(SIGKILL, tsk);
 			}
 			raw_spin_unlock(&tinfo->lock);
 		}
@@ -478,8 +510,8 @@ static long gmcres_admit_task(struct task_struct *tsk)
 	tinfo->gtdres = gtdres;
 	tinfo->gtdinterval = NULL;
 	tinfo->major_cycle_start = GTDRES_TIME_NA;
-	hrtimer_init(&tinfo->interval_timer, CLOCK_MONOTONIC, HRTIMER_MODE_ABS);
-	tinfo->interval_timer.function = on_interval_timer;
+	hrtimer_init(&tinfo->event_timer, CLOCK_MONOTONIC, HRTIMER_MODE_ABS);
+	tinfo->event_timer.function = on_event_timer;
 	tsk_rt(tsk)->plugin_state = tinfo;
 
 	// Attempt attachment to the reservation
@@ -537,17 +569,19 @@ static lt_t next_task_timer(struct gmcres_task_state *tinfo, lt_t now)
 	return tinfo->major_cycle_start + tinfo->gtdinterval->end;
 }
 
-// If required, advance interval_timer to the given deadline. This must be called
-// with interrupts disabled and the task structure locked.
-static void advance_interval_timer_at(struct task_struct *tsk, lt_t deadline)
+// If required, advance event_timer to the given deadline. This must be called
+// with interrupts disabled and the task structure locked. The current interval
+// must not be NULL.
+static void advance_event_timer_at(struct task_struct *tsk, lt_t deadline)
 {
 	struct gmcres_task_state *tinfo = get_gmcres_task_state(tsk);
-	if (lt_before(deadline, ktime_to_ns(hrtimer_get_expires(
-					&tinfo->interval_timer)))) {
+	WARN_ON(!tinfo->gtdinterval);
+	if (lt_before(deadline,
+		      ktime_to_ns(hrtimer_get_expires(&tinfo->event_timer)))) {
 		TRACE_TASK(
 			current,
 			"requires advancing timer since release is before next timer\n");
-		hrtimer_start(&tinfo->interval_timer, ns_to_ktime(deadline),
+		hrtimer_start(&tinfo->event_timer, ns_to_ktime(deadline),
 			      HRTIMER_MODE_ABS);
 	}
 }
@@ -581,7 +615,7 @@ static void gmcres_task_new(struct task_struct *tsk, int on_runqueue,
 	next_timer = next_task_timer(tinfo, now);
 	TRACE_TASK(tsk, "will set first timer for %llu (now is %llu)\n",
 		   next_timer, now);
-	hrtimer_start(&tinfo->interval_timer, ns_to_ktime(next_timer),
+	hrtimer_start(&tinfo->event_timer, ns_to_ktime(next_timer),
 		      HRTIMER_MODE_ABS);
 
 	TRACE_TASK(tsk,
@@ -648,7 +682,7 @@ static void gmcres_task_exit(struct task_struct *tsk)
 	TRACE_TASK(tsk, "exiting at %llu\n", litmus_clock());
 
 	// Ensure that the timer can no longer fire
-	hrtimer_cancel(&tinfo->interval_timer);
+	hrtimer_cancel(&tinfo->event_timer);
 
 	raw_spin_lock_irqsave(&tinfo->lock, flags);
 
@@ -818,8 +852,9 @@ static void gmcres_task_block(struct task_struct *tsk)
 
 	// If the task had already made a request for another CPU, we need to
 	// cancel it.
-	if (litmus_clock() >=
-	    tinfo->major_cycle_start + tinfo->gtdinterval->start) {
+	if (tinfo->gtdinterval &&
+	    litmus_clock() >=
+		    tinfo->major_cycle_start + tinfo->gtdinterval->start) {
 		int expected_cpu = tinfo->gtdinterval->cpu;
 		if (current_cpu != expected_cpu) {
 			TRACE_TASK(
@@ -851,10 +886,13 @@ static void gmcres_task_wake_up(struct task_struct *tsk)
 	raw_spin_lock_irqsave(&tinfo->lock, flags);
 
 	// If the task is in an interval, check the CPU it would like to be scheduled on
-	expected_cpu = litmus_clock() >= tinfo->major_cycle_start +
-						 tinfo->gtdinterval->start ?
-				     tinfo->gtdinterval->cpu :
-				     NO_CPU;
+	expected_cpu =
+		tinfo->gtdinterval &&
+				litmus_clock() >=
+					tinfo->major_cycle_start +
+						tinfo->gtdinterval->start ?
+			      tinfo->gtdinterval->cpu :
+			      NO_CPU;
 
 	// If another CPU than the current one is expected, mark the task as requested
 	// and provoke a reschedule at both places.
@@ -980,7 +1018,7 @@ long gmcres_complete_job(void)
 		   now, get_release(current), get_deadline(current));
 	if (!is_released(current, now)) {
 		struct gmcres_cpu_state *state = local_cpu_state();
-		advance_interval_timer_at(current, get_release(current));
+		advance_event_timer_at(current, get_release(current));
 		raw_spin_lock(&state->lock);
 		WARN_ON(state->scheduled != current);
 		if (state->linked == current)
