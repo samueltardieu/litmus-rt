@@ -72,6 +72,10 @@ struct gmcres_task_state {
 	// of an interval, or a task release time. It can only be armed if an
 	// interval is defined.
 	struct hrtimer event_timer;
+
+	// This flag means that the task wants to die; to do so, it must be scheduled at
+	// some point in order to acknowledge the SIGKILL sent to it.
+	int wants_to_die : 1;
 };
 
 // The current criticality mode
@@ -100,8 +104,9 @@ static struct gmcres_task_state *get_gmcres_task_state(struct task_struct *tsk)
 // Take the next task scheduling decision and return the time at which the
 // decision should be reconsidered. This function must be called with the
 // gmcres_task_state lock held and IRQ disabled. Returning GTDRES_TIME_NA
-// means that we do not want a timer to be set. If there is no interval,
-// GTDRES_TIME_NA is returned.
+// means that we do not want a timer to be set or that the task wants
+// to die and hopes to find a free CPU. If there is no interval, GTDRES_TIME_NA
+// is returned.
 static lt_t task_scheduling_decision(struct task_struct *tsk)
 {
 	struct gmcres_task_state *tinfo = get_gmcres_task_state(tsk);
@@ -109,14 +114,40 @@ static lt_t task_scheduling_decision(struct task_struct *tsk)
 	lt_t now, start, end, next_timer;
 	int previous_cpu, next_cpu;
 	unsigned int scm;
-	bool is_inside_interval, is_running, is_last_of_period,
+	bool is_inside_interval, is_running, is_retained, is_last_of_period,
 		past_current_interval;
 
 	now = litmus_clock();
-	scm = atomic_read(&system_criticality_mode);
+
+	// If the task wants to die, check for a free CPU to complete its death every 10ms
+	// give or take.
+	if (tinfo->wants_to_die) {
+		unsigned int cpu;
+		int exit_loop = 0;
+
+		TRACE_TASK(tsk, "looking for a CPU to die on\n");
+		for_each_online_cpu (cpu) {
+			state = cpu_state_for(cpu);
+			raw_spin_lock(&state->lock);
+			if (!state->scheduled && !state->linked) {
+				TRACE_TASK(tsk,
+					   "will try to use CPU %u to die on\n",
+					   cpu);
+				state->linked = tsk;
+				exit_loop = 1;
+				litmus_reschedule(cpu);
+			}
+			raw_spin_unlock(&state->lock);
+			if (exit_loop)
+				break;
+		}
+		return now + 10000000;
+	}
 
 	if (!tinfo->gtdinterval)
 		return GTDRES_TIME_NA;
+
+	scm = atomic_read(&system_criticality_mode);
 
 	// Is the task currently running?
 	is_running = tsk->state == TASK_RUNNING;
@@ -130,18 +161,24 @@ static lt_t task_scheduling_decision(struct task_struct *tsk)
 	// Are we past the current interval (dealing with the end)?
 	past_current_interval = now > tinfo->gtdinterval->end;
 
-	TRACE_TASK(tsk,
-		   "(is_running:%d - completed:%d) "
-		   "in task_scheduling_decision at %llu "
-		   "for interval [%llu-%llu) (cpu %d) (is-last-of-period:%d)\n",
-		   is_running, is_completed(tsk), now,
-		   tinfo->major_cycle_start + tinfo->gtdinterval->start,
-		   tinfo->major_cycle_start + tinfo->gtdinterval->end,
-		   previous_cpu, is_last_of_period);
+	// Is the task being retained waiting for a synchronized release?
+	is_retained = tsk_rt(tsk)->sporadic_release;
+
+	TRACE_TASK(
+		tsk,
+		"(is_running:%d - completed:%d - is_retained:%d - is_present:%d) "
+		"in task_scheduling_decision at %llu "
+		"for interval [%llu-%llu) (cpu %d) (is-last-of-period:%d)\n",
+		is_running, is_completed(tsk), is_retained, is_present(tsk),
+		now, tinfo->major_cycle_start + tinfo->gtdinterval->start,
+		tinfo->major_cycle_start + tinfo->gtdinterval->end,
+		previous_cpu, is_last_of_period);
 
 	// Check if the task is overdue.
-	if (is_last_of_period && past_current_interval && !is_completed(tsk)) {
-		TRACE_TASK(tsk, "has missed its deadline at %llu\n", now);
+	if (is_last_of_period && past_current_interval && !is_completed(tsk) &&
+	    !is_retained && is_running) {
+		TRACE_TASK(tsk, "has missed its deadline (%llu) at %llu\n",
+			   tinfo->gtdinterval->end, now);
 		TRACE_TASK(
 			tsk,
 			"should change criticality mode (task current %u - max %u) "
@@ -301,14 +338,10 @@ static enum hrtimer_restart on_event_timer(struct hrtimer *timer)
 	struct task_struct *tsk = tinfo->gtdres->task;
 	lt_t next_timer;
 
-	// Sanity check
-	WARN_ON(!tinfo->gtdinterval);
-
 	// hrtimer handlers are called from a IRQ handler, so IRQ are already disabled
 	raw_spin_lock(&tinfo->lock);
 	next_timer = task_scheduling_decision(tsk);
 	if (next_timer != GTDRES_TIME_NA) {
-		WARN_ON(!tinfo->gtdinterval);
 		TRACE_TASK(tsk, "next timer expiration set to %llu\n",
 			   next_timer);
 		hrtimer_set_expires(timer, ns_to_ktime(next_timer));
@@ -370,7 +403,8 @@ static bool ensure_minimum_criticality_mode(unsigned int target_mode)
 			WARN_ON(tinfo->criticality_mode >= target_mode);
 			// Make the task deschedule itself from the CPU it was running on
 			next_timer = task_scheduling_decision(tsk);
-			WARN_ON(next_timer != GTDRES_TIME_NA);
+			WARN_ON(next_timer != GTDRES_TIME_NA &&
+				!tinfo->wants_to_die);
 			// Increase the task criticality mode and compute the new interval
 			tinfo->criticality_mode = target_mode;
 			gtd_reservation_find_interval(
@@ -382,26 +416,25 @@ static bool ensure_minimum_criticality_mode(unsigned int target_mode)
 			// the side effect of calling task_scheduling_decision twice is that
 			// all CPUs implicated in both previous and new criticality modes
 			// will be rescheduling.
-			if (next_timer != GTDRES_TIME_NA) {
-				hrtimer_start(&tinfo->event_timer,
-					      ns_to_ktime(next_timer),
-					      HRTIMER_MODE_ABS);
-				TRACE_TASK(tsk, "timer reset to %llu\n",
-					   next_timer);
-			} else {
+			if (next_timer == GTDRES_TIME_NA) {
+				// The task can no longer be scheduled. Send it a kill
+				// signal, set its wants_to_die field and let it set
+				// a timer so that it can terminate its death process
+				// while being scheduled.
 				hrtimer_cancel(&tinfo->event_timer);
+				WARN_ON(tinfo->gtdres->criticality_level >=
+					target_mode);
 				TRACE_TASK(
 					tsk,
-					"timer cancelled, task has no interval\n");
-				// TODO: terminate task properly by making it
-				// leave the real-time domain and receive a signal.
-				// This may be better done when descheduling the task if
-				// it is scheduled, or here otherwise.
-				// As this will call gmcres_task_exit, this must be done
-				// from a place where in a way where gtdenv->writer_lock
-				// is not held.
-				// force_sig(SIGKILL, tsk);
+					"timer cancelled, task has no interval, giving it up\n");
+				tinfo->wants_to_die = 1;
+				next_timer = task_scheduling_decision(tsk);
+				WARN_ON(next_timer == GTDRES_TIME_NA);
 			}
+			hrtimer_start(&tinfo->event_timer,
+				      ns_to_ktime(next_timer),
+				      HRTIMER_MODE_ABS);
+			TRACE_TASK(tsk, "timer reset to %llu\n", next_timer);
 			raw_spin_unlock(&tinfo->lock);
 		}
 	}
@@ -414,6 +447,7 @@ static bool ensure_minimum_criticality_mode(unsigned int target_mode)
 static struct task_struct *gmcres_schedule(struct task_struct *prev)
 {
 	struct gmcres_cpu_state *state = local_cpu_state();
+	struct task_struct *tsk;
 	lt_t now;
 
 	raw_spin_lock(&state->lock);
@@ -425,8 +459,7 @@ static struct task_struct *gmcres_schedule(struct task_struct *prev)
 	state->prev_was_realtime = prev && is_realtime(prev);
 	WARN_ON(state->scheduled && !state->prev_was_realtime);
 
-	// Restart at this point if the system criticality mode changed while
-	// this CPU has been busy selecting a task.
+	// Restart here if a mode change happens during the scheduling.
 restart:
 
 	// Check if we need to execute a requested criticality mode change.
@@ -460,20 +493,30 @@ restart:
 			TRACE_TASK(state->linked, "scheduled at %llu\n", now);
 	}
 
-	state->scheduled = state->linked;
+	tsk = state->scheduled = state->linked;
 	sched_state_task_picked();
+
+	raw_spin_unlock(&state->lock);
+
+	if (atomic_read(&access_counter)) {
+		TRACE("access_counter is %d\n", atomic_read(&access_counter));
+	}
 
 	// Check if a system criticality mode change, or change in progress, has
 	// not made this scheduling decision obsolete already, and restart the
-	// process if it does.
+	// process if it does. It is important that we do this once the CPU state lock
+	// has been released, because the mode change process might also spin on this
+	// CPU lock.
 	if (atomic_read(&system_criticality_mode) > state->criticality_mode ||
 	    atomic_read(&access_counter)) {
 		TRACE("Criticality mode increase detected while scheduling new task, "
 		      "restarting decision\n");
+		raw_spin_lock(&state->lock);
 		goto restart;
 	}
 
-	raw_spin_unlock(&state->lock);
+	if (tsk && get_gmcres_task_state(tsk)->wants_to_die)
+		send_sig(SIGKILL, tsk, 0);
 
 	return state->scheduled;
 }
@@ -512,6 +555,7 @@ static long gmcres_admit_task(struct task_struct *tsk)
 	tinfo->major_cycle_start = GTDRES_TIME_NA;
 	hrtimer_init(&tinfo->event_timer, CLOCK_MONOTONIC, HRTIMER_MODE_ABS);
 	tinfo->event_timer.function = on_event_timer;
+	tinfo->wants_to_die = 0;
 	tsk_rt(tsk)->plugin_state = tinfo;
 
 	// Attempt attachment to the reservation
@@ -575,7 +619,6 @@ static lt_t next_task_timer(struct gmcres_task_state *tinfo, lt_t now)
 static void advance_event_timer_at(struct task_struct *tsk, lt_t deadline)
 {
 	struct gmcres_task_state *tinfo = get_gmcres_task_state(tsk);
-	WARN_ON(!tinfo->gtdinterval);
 	if (lt_before(deadline,
 		      ktime_to_ns(hrtimer_get_expires(&tinfo->event_timer)))) {
 		TRACE_TASK(
