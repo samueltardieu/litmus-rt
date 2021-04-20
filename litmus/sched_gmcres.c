@@ -88,6 +88,10 @@ static atomic_t access_counter;
 // by the plugin.
 static atomic_t maximum_criticality_level;
 
+// The current major cycle of executing tasks. Never zero, but only meaningful
+// when at least one task has entered the system.
+static lt_t system_major_cycle;
+
 static struct gmcres_task_state *get_gmcres_task_state(struct task_struct *tsk)
 {
 	return tsk_rt(tsk)->plugin_state;
@@ -528,6 +532,7 @@ static long gmcres_admit_task(struct task_struct *tsk)
 	struct gtd_reservation *gtdres = gtd_env_find(&gtdenv, res_id);
 	lt_t period = get_rt_period(tsk);
 	long ret = 0;
+	unsigned long flags;
 
 	if (!gtdres) {
 		TRACE_TASK(tsk, "requires an unknown reservation %u\n", res_id);
@@ -543,6 +548,34 @@ static long gmcres_admit_task(struct task_struct *tsk)
 			period, res_id, gtdres->major_cycle);
 		return -EINVAL;
 	}
+
+	// If the task major cycle is different from the system major cycle,
+	// check that we have no task currently in the system. If we have none,
+	// update the system major cycle and ensure that the system criticality mode
+	// is at its minimum, otherwise refuse the task.
+	raw_spin_lock_irqsave(&gtdenv.writer_lock, flags);
+	if (gtdres->major_cycle != system_major_cycle) {
+		struct gtd_reservation *res;
+		list_for_each_entry (res, &gtdenv.all_reservations,
+				     all_reservations_list)
+			if (res->task) {
+				TRACE_TASK(
+					tsk,
+					"new task reservation uses a a major cycle (%llu) "
+					"different from the current system major cycle (%llu)\n",
+					gtdres->major_cycle,
+					system_major_cycle);
+				raw_spin_unlock_irqrestore(&gtdenv.writer_lock,
+							   flags);
+				return -EINVAL;
+			}
+		// Update the system major cycle and reset criticality mode
+		TRACE("setting the system major cycle to %llu\n",
+		      gtdres->major_cycle);
+		system_major_cycle = gtdres->major_cycle;
+		atomic_set(&system_criticality_mode, 0);
+	}
+	raw_spin_unlock_irqrestore(&gtdenv.writer_lock, flags);
 
 	tinfo = kzalloc(sizeof(*tinfo), GFP_ATOMIC);
 	if (!tinfo)
@@ -995,6 +1028,7 @@ static long gmcres_activate_plugin(void)
 	atomic_set(&system_criticality_mode, 0);
 	atomic_set(&access_counter, 0);
 	atomic_set(&maximum_criticality_level, 0);
+	system_major_cycle = 1000000; // Meaningless but non-zero value
 
 	gtd_env_init(&gtdenv);
 
