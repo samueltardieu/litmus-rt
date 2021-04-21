@@ -20,6 +20,14 @@
 #include <litmus/reservations/gtd-reservation.h>
 #include <litmus/sched_plugin.h>
 
+// The smallest acceptable major cycle in lt_t units (nanoseconds)
+// 1000ns = 1us
+#define MIN_MAJOR_CYCLE 1000
+
+// The number of bits on which the criticality mode is stored
+// 2^10 = 1024 criticality levels
+#define CRIT_MODE_BITS 10
+
 static struct gtd_env gtdenv;
 
 struct gmcres_cpu_state {
@@ -825,6 +833,14 @@ static long gmcres_reservation_create(int res_type, void *__user _config)
 		return -EINVAL;
 	}
 
+	if (config.table_driven_params.major_cycle_length < MIN_MAJOR_CYCLE) {
+		TRACE("Invalid reservation (%u): major cycle (%llu) is smaller "
+		      "than the minimum allowed (%llu)\n",
+		      config.id, config.table_driven_params.major_cycle_length,
+		      MIN_MAJOR_CYCLE);
+		return -EINVAL;
+	}
+
 	raw_spin_lock(&gtdenv.writer_lock);
 	ret = gtd_env_find_or_create(&gtdenv, &config, &gtdres);
 	if (ret < 0) {
@@ -838,6 +854,14 @@ static long gmcres_reservation_create(int res_type, void *__user _config)
 			     &interval,
 			     &config.table_driven_params.intervals[i],
 			     sizeof(interval)))) {
+			goto error_with_unlock;
+		}
+		if (interval.end / gtdres->major_cycle >= 1 << CRIT_MODE_BITS) {
+			TRACE("Cannot add interval [%llu-%llu] on CPU %d because it exceeds "
+			      "the greatest allowed number of criticality levels (%u)\n",
+			      interval.start, interval.end, config.cpu,
+			      (1 << CRIT_MODE_BITS) - 1);
+			ret = -EINVAL;
 			goto error_with_unlock;
 		}
 		ret = gtd_reservation_add_interval(gtdres, interval.start,
@@ -1028,7 +1052,7 @@ static long gmcres_activate_plugin(void)
 	atomic_set(&system_criticality_mode, 0);
 	atomic_set(&access_counter, 0);
 	atomic_set(&maximum_criticality_level, 0);
-	system_major_cycle = 1000000; // Meaningless but non-zero value
+	system_major_cycle = MIN_MAJOR_CYCLE; // Meaningless but non-zero value
 
 	gtd_env_init(&gtdenv);
 
