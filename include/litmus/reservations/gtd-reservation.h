@@ -70,9 +70,7 @@ long gtd_reservation_mark_end_of_periods(struct gtd_reservation *gtdres,
 // Dump the current state of a reservation into Litmus trace device for debugging purpose
 void gtd_reservation_dump(struct gtd_reservation *gtdres);
 
-// Find the interval englobing time or following time (with wraparound) wich
-// matches the filter. A NULL filter matches everything. Set gtdinterval
-// and major_cycle_start to the right values.
+// Find the interval englobing time or following time (with wraparound).
 // Return true if an interval containing time is found, false if an interval
 // following is time is found or if no interval matches. In the later case,
 // gtdinterval is set to NULL and major_cycle_start to GTDRES_TIME_NA.

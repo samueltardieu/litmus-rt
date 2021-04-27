@@ -298,8 +298,7 @@ bool gtd_reservation_find_interval(struct gtd_reservation *gtdres,
 			end += gtdres->major_cycle;
 		}
 		// If time is within the interval or it is the next one (that we
-		// know so far) that we are going to see happening with this filter,
-		// record it.
+		// know so far), record it.
 		if (start <= time || start - time < next_interval_delay) {
 			*gtdinterval = interval;
 			*major_cycle_start = start - interval->start;
