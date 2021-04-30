@@ -161,6 +161,17 @@ static struct gmcres_task_state *get_gmcres_task_state(struct task_struct *tsk)
 		      irqs_disabled());                                                    \
 	} while (0)
 
+// Enhance TRACE and TRACE_TASK with timing and reservation information
+#undef TRACE
+#define TRACE(fmt, args...)                                                    \
+	LITMUS_TRACE("(now:%llu - %s) " fmt, litmus_clock(), __FUNCTION__,     \
+		     ##args)
+#undef TRACE_TASK
+#define TRACE_TASK(t, fmt, args...)                                            \
+	LITMUS_TRACE_TASK(t, "(now:%llu - res:%u - %s) " fmt, litmus_clock(),  \
+			  get_gmcres_task_state(t)->gtdres->id, __FUNCTION__,  \
+			  ##args)
+
 // Take the next task scheduling decision and return the time at which the
 // decision should be reconsidered. This function must be called with the
 // gmcres_task_state lock held and IRQ disabled. Returning GTDRES_TIME_NA
@@ -214,9 +225,8 @@ static lt_t task_scheduling_decision(struct task_struct *tsk)
 	// Check if the task is overdue.
 	if (is_last_of_period && past_current_interval && !is_completed(tsk) &&
 	    !is_retained && is_running) {
-		TRACE_TASK(tsk, "has missed its deadline (%llu) at %llu\n",
-			   tinfo->major_cycle_start + tinfo->gtdinterval->end,
-			   now);
+		TRACE_TASK(tsk, "has missed its deadline (%llu)\n",
+			   tinfo->major_cycle_start + tinfo->gtdinterval->end);
 		TRACE_TASK(
 			tsk,
 			"should change criticality mode (task current %u - max %u) "
@@ -259,7 +269,7 @@ static lt_t task_scheduling_decision(struct task_struct *tsk)
 
 	// If the task has been released, release it (mark it as not completed)
 	if (is_completed(tsk) && is_released(tsk, now)) {
-		TRACE_TASK(tsk, "releasing at %llu\n", now);
+		TRACE_TASK(tsk, "releasing\n");
 		tsk_rt(tsk)->completed = 0;
 	}
 
@@ -326,7 +336,8 @@ static lt_t task_scheduling_decision(struct task_struct *tsk)
 	state = cpu_state_for(previous_cpu);
 	raw_spin_lock(&state->lock);
 	if (next_cpu == previous_cpu) {
-		TRACE_TASK(tsk, "requesting scheduling on CPU %d\n", next_cpu);
+		TRACE_TASK(tsk, "requesting scheduling on same CPU %d\n",
+			   next_cpu);
 		state->linked = tsk;
 		if (state->scheduled != tsk)
 			litmus_reschedule(previous_cpu);
@@ -351,7 +362,8 @@ static lt_t task_scheduling_decision(struct task_struct *tsk)
 		// anyway and the current task will be scheduled spontaneously once
 		// state->linked is set and the lock is released.
 		needs_reschedule = !(state->scheduled && !state->linked);
-		TRACE_TASK(tsk, "requesting scheduling on CPU %d\n", next_cpu);
+		TRACE_TASK(tsk, "requesting scheduling on new CPU %d\n",
+			   next_cpu);
 		state->linked = tsk;
 		if (needs_reschedule)
 			litmus_reschedule(next_cpu);
@@ -369,11 +381,10 @@ static lt_t task_scheduling_decision(struct task_struct *tsk)
 		}
 		TRACE_TASK(
 			tsk,
-			"computing next timer at %llu (now is %llu) for interval [%llu-%llu)\n",
-			next_timer, now, start, end);
+			"computing next timer at %llu for interval [%llu-%llu)\n",
+			next_timer, start, end);
 	} else {
-		TRACE_TASK(tsk, "at %llu will no longer get timer interrupts\n",
-			   now);
+		TRACE_TASK(tsk, "will no longer get timer interrupts\n");
 		next_timer = GTDRES_TIME_NA;
 	}
 
@@ -540,10 +551,9 @@ restart:
 	// Link the task we were asked to link
 	if (state->scheduled != state->linked) {
 		if (state->scheduled)
-			TRACE_TASK(state->scheduled, "descheduled at %llu\n",
-				   now);
+			TRACE_TASK(state->scheduled, "descheduled\n");
 		if (state->linked)
-			TRACE_TASK(state->linked, "scheduled at %llu\n", now);
+			TRACE_TASK(state->linked, "scheduled\n");
 	}
 
 	tsk = state->scheduled = state->linked;
@@ -574,6 +584,8 @@ restart:
 
 static long gmcres_admit_task(struct task_struct *tsk)
 {
+	// Note: in this function, use LITMUS_TRACE_TASK instead of TRACE_TASK
+	// while the gmcres_task_state is not complete and attached to the task.
 	struct gmcres_task_state *tinfo;
 	unsigned int res_id = tsk_rt(tsk)->task_params.cpu;
 	struct gtd_reservation *gtdres = gtd_env_find(&gtdenv, res_id);
@@ -582,13 +594,14 @@ static long gmcres_admit_task(struct task_struct *tsk)
 	unsigned long flags;
 
 	if (!gtdres) {
-		TRACE_TASK(tsk, "requires an unknown reservation %u\n", res_id);
+		LITMUS_TRACE_TASK(tsk, "requires an unknown reservation %u\n",
+				  res_id);
 		return -EINVAL;
 	}
 
 	// The task period must divide the reservation major cycle
 	if (gtdres->major_cycle % period) {
-		TRACE_TASK(
+		LITMUS_TRACE_TASK(
 			tsk,
 			"period (%llu) is not an integral factor of the reservation %d "
 			"major cycle (%llu)\n",
@@ -606,7 +619,7 @@ static long gmcres_admit_task(struct task_struct *tsk)
 		list_for_each_entry (res, &gtdenv.all_reservations,
 				     all_reservations_list)
 			if (res->task) {
-				TRACE_TASK(
+				LITMUS_TRACE_TASK(
 					tsk,
 					"new task reservation uses a a major cycle (%llu) "
 					"different from the current system major cycle (%llu)\n",
@@ -617,8 +630,9 @@ static long gmcres_admit_task(struct task_struct *tsk)
 				return -EINVAL;
 			}
 		// Update the system major cycle and reset criticality mode
-		TRACE("setting the system major cycle to %llu\n",
-		      gtdres->major_cycle);
+		LITMUS_TRACE_TASK(tsk,
+				  "setting the system major cycle to %llu\n",
+				  gtdres->major_cycle);
 		system_major_cycle = gtdres->major_cycle;
 		atomic64_set(&system_criticality_state,
 			     criticality_state(litmus_clock(), 0));
@@ -637,6 +651,8 @@ static long gmcres_admit_task(struct task_struct *tsk)
 	hrtimer_init(&tinfo->event_timer, CLOCK_MONOTONIC, HRTIMER_MODE_ABS);
 	tinfo->event_timer.function = on_event_timer;
 	tsk_rt(tsk)->plugin_state = tinfo;
+
+	// Note: TRACE_TASK can be used from now on
 
 	// Attempt attachment to the reservation
 	raw_spin_lock(&gtdres->lock);
@@ -815,6 +831,9 @@ static void gmcres_task_exit(struct task_struct *tsk)
 	tcl = tinfo->gtdres->criticality_level;
 	raw_spin_unlock(&tinfo->gtdres->lock);
 
+	// Note: use LITMUS_TRACE_TASK instead of TRACE_TASK from now on since
+	// the reservation is detached from the task.
+
 	// If the exiting task had the maximum criticality level and it was
 	// not 0, update the maximum criticality level since it might have
 	// gone down.
@@ -921,8 +940,7 @@ error_with_unlock:
 static bool gmcres_post_migration_validate(struct task_struct *next)
 {
 	struct gmcres_cpu_state *state = local_cpu_state();
-	TRACE_TASK(next, "has arrived on CPU %d at %llu\n", state->cpu,
-		   litmus_clock());
+	TRACE_TASK(next, "has arrived on CPU %d\n", state->cpu);
 	return 1;
 }
 
@@ -937,7 +955,7 @@ static bool gmcres_should_wait_for_stack(struct task_struct *next)
 	unsigned long flags;
 
 	raw_spin_lock_irqsave(&state->lock, flags);
-	TRACE_TASK(next, "cannot be acquired now at %llu\n", litmus_clock());
+	TRACE_TASK(next, "cannot be acquired now\n");
 	if (state->linked != next) {
 		raw_spin_unlock_irqrestore(&state->lock, flags);
 		TRACE_TASK(
@@ -972,7 +990,7 @@ static void gmcres_task_block(struct task_struct *tsk)
 	unsigned long flags;
 	int current_cpu;
 
-	TRACE_TASK(tsk, "blocked at %llu\n", litmus_clock());
+	TRACE_TASK(tsk, "blocked\n");
 
 	raw_spin_lock_irqsave(&tinfo->lock, flags);
 
@@ -1018,7 +1036,7 @@ static void gmcres_task_wake_up(struct task_struct *tsk)
 	unsigned long flags;
 	int expected_cpu;
 
-	TRACE_TASK(tsk, "is waking up at %llu\n", litmus_clock());
+	TRACE_TASK(tsk, "is waking up\n");
 
 	raw_spin_lock_irqsave(&tinfo->lock, flags);
 
@@ -1151,9 +1169,9 @@ long gmcres_complete_job(void)
 	prepare_for_next_period(current);
 	now = litmus_clock();
 	TRACE_TASK(current,
-		   "has completed its job at %llu - "
+		   "has completed its job - "
 		   "next release will be %llu, deadline will be %llu\n",
-		   now, get_release(current), get_deadline(current));
+		   get_release(current), get_deadline(current));
 	if (!is_released(current, now)) {
 		struct gmcres_cpu_state *state = local_cpu_state();
 		advance_event_timer_at(current, get_release(current));
@@ -1167,10 +1185,9 @@ long gmcres_complete_job(void)
 		litmus_reschedule_local();
 		tsk_rt(current)->completed = 1;
 	} else {
-		TRACE_TASK(
-			current,
-			"at %llu is already past its next release date %llu\n",
-			now, get_release(current));
+		TRACE_TASK(current,
+			   "is already past its next release date %llu\n",
+			   get_release(current));
 	}
 
 	raw_spin_unlock_irqrestore(&tinfo->lock, flags);
