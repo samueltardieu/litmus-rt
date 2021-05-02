@@ -215,10 +215,9 @@ static lt_t task_scheduling_decision(struct task_struct *tsk)
 	TRACE_TASK(
 		tsk,
 		"(is_running:%d - completed:%d - is_retained:%d - is_present:%d) "
-		"in task_scheduling_decision at %llu "
-		"for interval [%llu-%llu) (cpu %d) (is-last-of-period:%d)\n",
+		"for interval [%llu-%llu] (cpu %d) (is-last-of-period:%d)\n",
 		is_running, is_completed(tsk), is_retained, is_present(tsk),
-		now, tinfo->major_cycle_start + tinfo->gtdinterval->start,
+		tinfo->major_cycle_start + tinfo->gtdinterval->start,
 		tinfo->major_cycle_start + tinfo->gtdinterval->end,
 		previous_cpu, is_last_of_period);
 
@@ -317,7 +316,7 @@ static lt_t task_scheduling_decision(struct task_struct *tsk)
 
 		TRACE_TASK(
 			tsk,
-			"has computed new interval [%llu-%llu) (cpu %d) (is_inside_interval:%d)\n",
+			"has computed new interval [%llu-%llu] (cpu %d) (is_inside_interval:%d)\n",
 			start, end, tinfo->gtdinterval->cpu,
 			is_inside_interval);
 		// Check the next CPU to use, or NO_CPU
@@ -381,7 +380,7 @@ static lt_t task_scheduling_decision(struct task_struct *tsk)
 		}
 		TRACE_TASK(
 			tsk,
-			"computing next timer at %llu for interval [%llu-%llu)\n",
+			"computing next timer at %llu for interval [%llu-%llu]\n",
 			next_timer, start, end);
 	} else {
 		TRACE_TASK(tsk, "will no longer get timer interrupts\n");
@@ -401,6 +400,12 @@ static enum hrtimer_restart on_event_timer(struct hrtimer *timer)
 
 	// hrtimer handlers are called from a IRQ handler, so IRQ are already disabled
 	raw_spin_lock(&tinfo->lock);
+	if (tinfo->gtdinterval)
+		TRACE_TASK(tsk, "on timer with interval [%llu-%llu]\n",
+			   tinfo->major_cycle_start + tinfo->gtdinterval->start,
+			   tinfo->major_cycle_start + tinfo->gtdinterval->end);
+	else
+		TRACE_TASK(tsk, "on timer with no interval");
 	next_timer = task_scheduling_decision(tsk);
 	if (next_timer != GTDRES_TIME_NA) {
 		TRACE_TASK(tsk, "next timer expiration set to %llu\n",
@@ -445,6 +450,8 @@ static bool ensure_minimum_criticality_state(uint64_t target_state)
 		atomic_dec(&access_counter);
 		return false;
 	}
+
+	TRACE("switching to criticality mode %u\n", target_mode);
 
 	// For every task in the reservations, reconsider scheduling decisions.
 	// To ensure new reservations are not added, use the reservation lock.
@@ -503,6 +510,8 @@ static bool ensure_minimum_criticality_state(uint64_t target_state)
 	}
 	raw_spin_unlock_irqrestore(&gtdenv.writer_lock, flags);
 
+	TRACE("criticality mode switch done\n");
+
 	atomic_dec_return_release(&access_counter);
 	return true;
 }
@@ -510,7 +519,6 @@ static bool ensure_minimum_criticality_state(uint64_t target_state)
 static struct task_struct *gmcres_schedule(struct task_struct *prev)
 {
 	struct gmcres_cpu_state *state = local_cpu_state();
-	struct task_struct *tsk;
 	lt_t now;
 
 	raw_spin_lock(&state->lock);
@@ -535,7 +543,7 @@ restart:
 		// Unlock the CPU state around the criticality mode change as requested
 		// by the function contract.
 		raw_spin_unlock(&state->lock);
-		TRACE("Ensuring that criticality mode is at least %u\n",
+		TRACE("ensuring that criticality mode is at least %u\n",
 		      criticality_mode(lcs));
 		ensure_minimum_criticality_state(lcs);
 		// Wait for a concurrent mode change to be over
@@ -547,6 +555,8 @@ restart:
 	state->criticality_state = atomic64_read(&system_criticality_state);
 
 	now = litmus_clock();
+	TRACE("scheduling with criticality mode %u\n",
+	      criticality_mode(state->criticality_state));
 
 	// Link the task we were asked to link
 	if (state->scheduled != state->linked) {
@@ -554,9 +564,10 @@ restart:
 			TRACE_TASK(state->scheduled, "descheduled\n");
 		if (state->linked)
 			TRACE_TASK(state->linked, "scheduled\n");
-	}
+	} else if (state->scheduled)
+		TRACE_TASK(state->scheduled, "already scheduled\n");
 
-	tsk = state->scheduled = state->linked;
+	state->scheduled = state->linked;
 	sched_state_task_picked();
 
 	raw_spin_unlock(&state->lock);
@@ -573,12 +584,19 @@ restart:
 	if (atomic64_read(&system_criticality_state) >
 		    state->criticality_state ||
 	    atomic_read(&access_counter)) {
-		TRACE("Criticality mode increase detected while scheduling new task, "
+		TRACE("criticality mode increase detected while scheduling new task, "
 		      "restarting decision\n");
 		raw_spin_lock(&state->lock);
 		goto restart;
 	}
 
+	if (state->scheduled)
+		TRACE_TASK(state->scheduled,
+			   "returning decision for criticality mode %u\n",
+			   criticality_mode(state->criticality_state));
+	else
+		TRACE("returning decision (nothing) for criticality mode %u\n",
+		      criticality_mode(state->criticality_state));
 	return state->scheduled;
 }
 
@@ -745,7 +763,7 @@ static void gmcres_task_new(struct task_struct *tsk, int on_runqueue,
 	BUG_ON(!tinfo->gtdinterval);
 	TRACE_TASK(
 		tsk,
-		"registers interest for interval [%llu-%llu) (is_inside_interval:%d)\n",
+		"registers interest for interval [%llu-%llu] (is_inside_interval:%d)\n",
 		tinfo->major_cycle_start + tinfo->gtdinterval->start,
 		tinfo->major_cycle_start + tinfo->gtdinterval->end,
 		is_inside_interval);
