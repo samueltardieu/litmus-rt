@@ -502,7 +502,7 @@ static bool ensure_minimum_criticality_state(uint64_t target_state)
 				TRACE_TASK(tsk, "timer reset to %llu\n",
 					   next_timer);
 			} else {
-				hrtimer_cancel(&tinfo->event_timer);
+				hrtimer_try_to_cancel(&tinfo->event_timer);
 				TRACE_TASK(tsk, "timer cancelled\n");
 			}
 			raw_spin_unlock(&tinfo->lock);
@@ -836,7 +836,7 @@ static void gmcres_task_exit(struct task_struct *tsk)
 
 	TRACE_TASK(tsk, "exiting at %llu\n", litmus_clock());
 
-	// Ensure that the timer can no longer fire
+	// Synchronously ensure that the timer can no longer fire
 	hrtimer_cancel(&tinfo->event_timer);
 
 	raw_spin_lock_irqsave(&tinfo->lock, flags);
