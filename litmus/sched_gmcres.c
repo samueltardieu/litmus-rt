@@ -174,27 +174,20 @@ static struct gmcres_task_state *get_gmcres_task_state(struct task_struct *tsk)
 
 // Take the next task scheduling decision and return the time at which the
 // decision should be reconsidered. This function must be called with the
-// gmcres_task_state lock held and IRQ disabled. Returning GTDRES_TIME_NA
-// means that we do not want a timer. If there is no interval, GTDRES_TIME_NA
-// is returned.
-// If the interval crosses a major cycle boundary, reset the task criticality
-// mode to 0 and use this criticality mode.
+// gmcres_task_state lock held and IRQ disabled.
+// If the interval crosses a major cycle boundary, or if the task has an insufficient
+// criticality level, reset the task criticality mode to 0 and use this criticality mode.
 static lt_t task_scheduling_decision(struct task_struct *tsk)
 {
 	struct gmcres_task_state *tinfo = get_gmcres_task_state(tsk);
 	struct gmcres_cpu_state *state;
-	lt_t now, start, end, next_timer;
+	const lt_t now = litmus_clock();
+	const lt_t current_major_cycle_start = major_cycle_start(now);
+	lt_t start, end, next_timer;
 	int previous_cpu, next_cpu;
-	unsigned int scm;
+	unsigned int scm = system_criticality_mode();
 	bool is_inside_interval, is_running, is_retained, is_last_of_period,
 		past_current_interval;
-
-	now = litmus_clock();
-
-	if (!tinfo->gtdinterval)
-		return GTDRES_TIME_NA;
-
-	scm = system_criticality_mode();
 
 	// Is the task currently running?
 	is_running = tsk->state == TASK_RUNNING;
@@ -221,9 +214,11 @@ static lt_t task_scheduling_decision(struct task_struct *tsk)
 		tinfo->major_cycle_start + tinfo->gtdinterval->end,
 		previous_cpu, is_last_of_period);
 
-	// Check if the task is overdue.
+	// Check if the task is overdue - if the task criticality mode is different
+	// from the system one, do nothing here as we are called from the mode change
+	// function.
 	if (is_last_of_period && past_current_interval && !is_completed(tsk) &&
-	    !is_retained && is_running) {
+	    !is_retained && is_running && tinfo->criticality_mode == scm) {
 		TRACE_TASK(tsk, "has missed its deadline (%llu)\n",
 			   tinfo->major_cycle_start + tinfo->gtdinterval->end);
 		TRACE_TASK(
@@ -250,14 +245,13 @@ static lt_t task_scheduling_decision(struct task_struct *tsk)
 					"using CPU %d to trigger criticality mode increase to %u\n",
 					previous_cpu,
 					tinfo->criticality_mode + 1);
+				TRACE_TASK(
+					tsk,
+					"reschedule operation requested for CPU %d\n",
+					previous_cpu);
 				litmus_reschedule(previous_cpu);
 			}
 			raw_spin_unlock(&state->lock);
-
-			// Do not set a new timer right now, the mode change will take effect
-			// as soon as the scheduling takes place and a new interval will be
-			// computed.
-			tinfo->gtdinterval = NULL;
 		} else
 			TRACE_TASK(
 				tsk,
@@ -272,78 +266,75 @@ static lt_t task_scheduling_decision(struct task_struct *tsk)
 		tsk_rt(tsk)->completed = 0;
 	}
 
-	// If the task criticality mode is lower than the system one, do not
-	// schedule an interval and wait for the task criticality mode to be
-	// increased externally by the mode change procedure.
-	if (tinfo->criticality_mode < scm)
-		tinfo->gtdinterval = NULL;
-
-	// Advance intervals as much as needed if there is an interval. In any case, set
-	// start, end, is_inside_interval and next_cpu.
-	if (tinfo->gtdinterval) {
-		const lt_t current_major_cycle_start = tinfo->major_cycle_start;
-		while ((end = tinfo->major_cycle_start +
-			      tinfo->gtdinterval->end) <= now)
+	// Advance intervals as much as needed if there is an interval and set end.
+	if (tinfo->criticality_mode == scm)
+		while (tinfo->major_cycle_start + tinfo->gtdinterval->end <=
+		       now)
 			tinfo->gtdinterval = gtd_reservation_next_interval(
 				tinfo->gtdres, tinfo->gtdinterval,
 				&tinfo->major_cycle_start);
-
-		// If the task criticality_mode is greater than 0 and the next interval is
-		// past the current major cycle, reset the task criticality mode to 0 and
-		// look for the first interval there.
-		if (tinfo->criticality_mode &&
-		    tinfo->major_cycle_start != current_major_cycle_start) {
-			TRACE_TASK(
-				tsk,
-				"returning to criticality mode 0 at next interval "
-				"starting at %llu\n",
-				current_major_cycle_start + system_major_cycle);
-			tinfo->criticality_mode = 0;
-			gtd_reservation_find_interval(
-				tinfo->gtdres, 0,
-				current_major_cycle_start + system_major_cycle,
-				&tinfo->gtdinterval, &tinfo->major_cycle_start);
-			WARN_ON(tinfo->major_cycle_start !=
-				current_major_cycle_start + system_major_cycle);
-			// Recompute end as it has been set to the wrong interval end in the
-			// while loop.
-			end = tinfo->major_cycle_start +
-			      tinfo->gtdinterval->end;
-		}
-
-		start = tinfo->major_cycle_start + tinfo->gtdinterval->start;
-		is_inside_interval = now >= start;
-
+	else {
+		// The system criticality mode is greater than the task one
 		TRACE_TASK(
 			tsk,
-			"has computed new interval [%llu-%llu] (cpu %d) (is_inside_interval:%d)\n",
-			start, end, tinfo->gtdinterval->cpu,
-			is_inside_interval);
-		// Check the next CPU to use, or NO_CPU
-		next_cpu =
-			is_inside_interval && is_running && !is_completed(tsk) ?
-				      tinfo->gtdinterval->cpu :
-				      NO_CPU;
-
-	} else {
-		start = end = GTDRES_TIME_NA;
-		is_inside_interval = false;
-		next_cpu = NO_CPU;
+			"looking for interval at different criticality mode %d (was %d)\n",
+			scm, tinfo->criticality_mode);
+		gtd_reservation_find_interval(tinfo->gtdres, scm, now,
+					      &tinfo->gtdinterval,
+					      &tinfo->major_cycle_start);
+		tinfo->criticality_mode = scm;
 	}
+
+	if (tinfo->criticality_mode &&
+	    (!tinfo->gtdinterval ||
+	     tinfo->major_cycle_start != current_major_cycle_start)) {
+		// We have no interval at the requested mode or it crosses a major cycle boundary.
+		// We must return to criticality mode 0.
+		TRACE_TASK(tsk, "falling back to criticality mode 0\n");
+		gtd_reservation_find_interval(
+			tinfo->gtdres, 0,
+			current_major_cycle_start + system_major_cycle,
+			&tinfo->gtdinterval, &tinfo->major_cycle_start);
+		WARN_ON(!tinfo->gtdinterval);
+		WARN_ON(tinfo->major_cycle_start !=
+			current_major_cycle_start + system_major_cycle);
+		tinfo->criticality_mode = 0;
+	}
+
+	start = tinfo->major_cycle_start + tinfo->gtdinterval->start;
+	end = tinfo->major_cycle_start + tinfo->gtdinterval->end;
+	is_inside_interval = now >= start;
+
+	TRACE_TASK(
+		tsk,
+		"has computed new interval [%llu-%llu] (cpu %d) (mode %d) (is_inside_interval:%d)\n",
+		start, end, tinfo->gtdinterval->cpu, tinfo->criticality_mode,
+		is_inside_interval);
+	// Check the next CPU to use, or NO_CPU
+	next_cpu = is_inside_interval && is_running && !is_completed(tsk) ?
+				 tinfo->gtdinterval->cpu :
+				 NO_CPU;
 
 	// Mark and reschedule concerned CPUs
 	state = cpu_state_for(previous_cpu);
 	raw_spin_lock(&state->lock);
 	if (next_cpu == previous_cpu) {
 		TRACE_TASK(tsk, "requesting scheduling on same CPU %d\n",
-			   next_cpu);
+			   previous_cpu);
 		state->linked = tsk;
-		if (state->scheduled != tsk)
+		if (state->scheduled != tsk) {
+			TRACE_TASK(
+				tsk,
+				"reschedule operation requested for CPU %d\n",
+				previous_cpu);
 			litmus_reschedule(previous_cpu);
+		}
 	} else if (state->linked == tsk) {
 		TRACE_TASK(tsk, "requesting descheduling from CPU %d\n",
 			   previous_cpu);
 		state->linked = NULL;
+		TRACE_TASK(tsk, "reschedule operation requested for CPU %d\n",
+			   previous_cpu);
 		litmus_reschedule(previous_cpu);
 	}
 	// If we have state->linked != tsk and state->scheduled == tsk,
@@ -364,28 +355,25 @@ static lt_t task_scheduling_decision(struct task_struct *tsk)
 		TRACE_TASK(tsk, "requesting scheduling on new CPU %d\n",
 			   next_cpu);
 		state->linked = tsk;
-		if (needs_reschedule)
+		if (needs_reschedule) {
+			TRACE_TASK(
+				tsk,
+				"reschedule operation requested for CPU %d\n",
+				next_cpu);
 			litmus_reschedule(next_cpu);
+		}
 		raw_spin_unlock(&state->lock);
 	}
 
 	// Set the timer to the next event (interval start or end, or task release)
-	// if the interval is not NULL.
-	if (tinfo->gtdinterval) {
-		next_timer = is_inside_interval ? end : start;
-		if (is_completed(tsk) &&
-		    lt_before(get_release(tsk), next_timer)) {
-			next_timer = get_release(tsk);
-			WARN_ON(lt_before(next_timer, now));
-		}
-		TRACE_TASK(
-			tsk,
-			"computing next timer at %llu for interval [%llu-%llu]\n",
-			next_timer, start, end);
-	} else {
-		TRACE_TASK(tsk, "will no longer get timer interrupts\n");
-		next_timer = GTDRES_TIME_NA;
+	next_timer = is_inside_interval ? end : start;
+	if (is_completed(tsk) && lt_before(get_release(tsk), next_timer)) {
+		next_timer = get_release(tsk);
+		WARN_ON(lt_before(next_timer, now));
 	}
+	TRACE_TASK(tsk,
+		   "computing next timer at %llu for interval [%llu-%llu]\n",
+		   next_timer, start, end);
 
 	return next_timer;
 }
@@ -407,18 +395,11 @@ static enum hrtimer_restart on_event_timer(struct hrtimer *timer)
 	else
 		TRACE_TASK(tsk, "on timer with no interval");
 	next_timer = task_scheduling_decision(tsk);
-	if (next_timer != GTDRES_TIME_NA) {
-		TRACE_TASK(tsk, "next timer expiration set to %llu\n",
-			   next_timer);
-		hrtimer_set_expires(timer, ns_to_ktime(next_timer));
-	} else {
-		WARN_ON(tinfo->gtdinterval);
-		TRACE_TASK(tsk, "no timer is set\n");
-	}
+	TRACE_TASK(tsk, "next timer expiration set to %llu\n", next_timer);
+	hrtimer_set_expires(timer, ns_to_ktime(next_timer));
 	raw_spin_unlock(&tinfo->lock);
 
-	return next_timer == GTDRES_TIME_NA ? HRTIMER_NORESTART :
-						    HRTIMER_RESTART;
+	return HRTIMER_RESTART;
 }
 
 // Ensure that the criticality state is at least target_state when exiting this function.
@@ -432,8 +413,6 @@ static enum hrtimer_restart on_event_timer(struct hrtimer *timer)
 static bool ensure_minimum_criticality_state(uint64_t target_state)
 {
 	struct gtd_reservation *gtdres;
-	lt_t now = litmus_clock();
-	lt_t current_major_cycle_start = major_cycle_start(now);
 	unsigned int target_mode = criticality_mode(target_state);
 	uint64_t current_state;
 	unsigned long flags;
@@ -464,47 +443,15 @@ static bool ensure_minimum_criticality_state(uint64_t target_state)
 				get_gmcres_task_state(tsk);
 			lt_t next_timer;
 			raw_spin_lock(&tinfo->lock);
-			WARN_ON(tinfo->criticality_mode >= target_mode);
-			// Make the task deschedule itself from the CPU it was running on
-			next_timer = task_scheduling_decision(tsk);
-			WARN_ON(next_timer != GTDRES_TIME_NA);
-			// Increase the task criticality mode and compute the new interval
-			tinfo->criticality_mode = target_mode;
-			gtd_reservation_find_interval(
-				tinfo->gtdres, target_mode, now,
-				&tinfo->gtdinterval, &tinfo->major_cycle_start);
-			// If we got no interval at this criticality mode, or if it goes
-			// through a major cycle, get the first interval at criticality mode 0.
-			// The call to task_scheduling_decision() will reset the task criticality
-			// mode properly.
-			if (!tinfo->gtdinterval ||
-			    tinfo->major_cycle_start !=
-				    current_major_cycle_start) {
-				gtd_reservation_find_interval(
-					tinfo->gtdres, 0,
-					current_major_cycle_start +
-						system_major_cycle,
-					&tinfo->gtdinterval,
-					&tinfo->major_cycle_start);
-			}
-			next_timer = task_scheduling_decision(tsk);
-			WARN_ON(next_timer == GTDRES_TIME_NA);
 
-			// If the task can be scheduled (if its criticality level is not
-			// less than the system criticality level), start a timer. Note that
-			// the side effect of calling task_scheduling_decision twice is that
-			// all CPUs implicated in both previous and new criticality modes
-			// will be rescheduling.
-			if (next_timer != GTDRES_TIME_NA) {
-				hrtimer_start(&tinfo->event_timer,
-					      ns_to_ktime(next_timer),
-					      HRTIMER_MODE_ABS);
-				TRACE_TASK(tsk, "timer reset to %llu\n",
-					   next_timer);
-			} else {
-				hrtimer_try_to_cancel(&tinfo->event_timer);
-				TRACE_TASK(tsk, "timer cancelled\n");
-			}
+			// Make the task compute its next iteration time at either the
+			// current criticality mode if appropriate, or at criticality
+			// mode 0 at the next major cycle.
+			next_timer = task_scheduling_decision(tsk);
+			hrtimer_start(&tinfo->event_timer,
+				      ns_to_ktime(next_timer),
+				      HRTIMER_MODE_ABS);
+			TRACE_TASK(tsk, "timer reset to %llu\n", next_timer);
 			raw_spin_unlock(&tinfo->lock);
 		}
 	}
@@ -556,7 +503,7 @@ restart:
 
 	now = litmus_clock();
 	TRACE("scheduling with criticality mode %u\n",
-	      criticality_mode(state->criticality_state));
+	      criticality_mode_at(state->criticality_state, now));
 
 	// Link the task we were asked to link
 	if (state->scheduled != state->linked) {
@@ -593,10 +540,10 @@ restart:
 	if (state->scheduled)
 		TRACE_TASK(state->scheduled,
 			   "returning decision for criticality mode %u\n",
-			   criticality_mode(state->criticality_state));
+			   criticality_mode_at(state->criticality_state, now));
 	else
 		TRACE("returning decision (nothing) for criticality mode %u\n",
-		      criticality_mode(state->criticality_state));
+		      criticality_mode_at(state->criticality_state, now));
 	return state->scheduled;
 }
 
