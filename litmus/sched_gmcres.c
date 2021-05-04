@@ -46,13 +46,6 @@ struct gmcres_cpu_state {
 
 	// Task interested in being scheduled
 	struct task_struct *linked;
-
-	// The CPU criticality state. This is used to trigger the mode changes
-	// since that cannot be done from a timer event so we defer it until
-	// schedule time. This can never go down.
-	// See the description of global variable system_criticality_state for
-	// an explanation on the content.
-	unsigned int criticality_state;
 };
 
 static DEFINE_PER_CPU(struct gmcres_cpu_state, gmcres_cpu_state);
@@ -156,7 +149,7 @@ static struct gmcres_task_state *get_gmcres_task_state(struct task_struct *tsk)
 // For debugging: add a trace to check if we are in an IRQ
 #define CHECK_IRQ_CONTEXT()                                                                \
 	do {                                                                               \
-		TRACE("%s: in_irq:%d, in_softirq:%d, in_interrupt:%d, irqs_disabled:%d\n", \
+		TRACE("%s: in_irq:%u, in_softirq:%u, in_interrupt:%u, irqs_disabled:%u\n", \
 		      __FUNCTION__, in_irq(), in_softirq(), in_interrupt(),                \
 		      irqs_disabled());                                                    \
 	} while (0)
@@ -172,12 +165,19 @@ static struct gmcres_task_state *get_gmcres_task_state(struct task_struct *tsk)
 			  get_gmcres_task_state(t)->gtdres->id, __FUNCTION__,  \
 			  ##args)
 
+static bool
+ensure_minimum_criticality_state(uint64_t target_state,
+				 struct task_struct *originating_task);
+
 // Take the next task scheduling decision and return the time at which the
 // decision should be reconsidered. This function must be called with the
 // gmcres_task_state lock held and IRQ disabled.
 // If the interval crosses a major cycle boundary, or if the task has an insufficient
 // criticality level, reset the task criticality mode to 0 and use this criticality mode.
-static lt_t task_scheduling_decision(struct task_struct *tsk)
+// min_criticality_mode, if not NULL, will be updated with the requested minimal criticality
+// mode in casd this task has missed its deadline, and let untouched otherwise.
+static lt_t task_scheduling_decision(struct task_struct *tsk,
+				     unsigned int *min_criticality_mode)
 {
 	struct gmcres_task_state *tinfo = get_gmcres_task_state(tsk);
 	struct gmcres_cpu_state *state;
@@ -207,8 +207,8 @@ static lt_t task_scheduling_decision(struct task_struct *tsk)
 
 	TRACE_TASK(
 		tsk,
-		"(is_running:%d - completed:%d - is_retained:%d - is_present:%d) "
-		"for interval [%llu-%llu] (cpu %d) (is-last-of-period:%d)\n",
+		"(is_running:%u - completed:%u - is_retained:%u - is_present:%u) "
+		"for interval [%llu-%llu] (cpu %u) (is-last-of-period:%u)\n",
 		is_running, is_completed(tsk), is_retained, is_present(tsk),
 		tinfo->major_cycle_start + tinfo->gtdinterval->start,
 		tinfo->major_cycle_start + tinfo->gtdinterval->end,
@@ -221,43 +221,15 @@ static lt_t task_scheduling_decision(struct task_struct *tsk)
 	    !is_retained && is_running && tinfo->criticality_mode == scm) {
 		TRACE_TASK(tsk, "has missed its deadline (%llu)\n",
 			   tinfo->major_cycle_start + tinfo->gtdinterval->end);
-		TRACE_TASK(
-			tsk,
-			"should change criticality mode (task current %u - max %u) "
-			"(system current %u - max %u)\n",
-			tinfo->criticality_mode,
-			tinfo->gtdres->criticality_level, scm,
-			atomic_read(&maximum_criticality_level));
 
-		// Only increase criticality mode if we have at least one task ready
-		// to execute at this mode.
-		if (tinfo->criticality_mode <
-		    atomic_read(&maximum_criticality_level)) {
-			// Use the last CPU we were scheduled on to trigger the mode change
-			state = cpu_state_for(previous_cpu);
-			raw_spin_lock(&state->lock);
-			if (criticality_mode_at(state->criticality_state, now) <
-			    tinfo->criticality_mode + 1) {
-				state->criticality_state = criticality_state(
-					now, tinfo->criticality_mode + 1);
-				TRACE_TASK(
-					tsk,
-					"using CPU %d to trigger criticality mode increase to %u\n",
-					previous_cpu,
-					tinfo->criticality_mode + 1);
-				TRACE_TASK(
-					tsk,
-					"reschedule operation requested for CPU %d\n",
-					previous_cpu);
-				litmus_reschedule(previous_cpu);
-			}
-			raw_spin_unlock(&state->lock);
-		} else
+		// Indicate that a criticality mode change is requested
+		if (min_criticality_mode) {
+			*min_criticality_mode = tinfo->criticality_mode + 1;
 			TRACE_TASK(
 				tsk,
-				"cannot increase criticality mode as there would be "
-				"no tasks to execute in criticality mode %u\n",
-				tinfo->criticality_mode + 1);
+				"will request a criticality mode of at least %u\n",
+				*min_criticality_mode);
+		}
 	}
 
 	// If the task has been released, release it (mark it as not completed)
@@ -277,7 +249,7 @@ static lt_t task_scheduling_decision(struct task_struct *tsk)
 		// The system criticality mode is greater than the task one
 		TRACE_TASK(
 			tsk,
-			"looking for interval at different criticality mode %d (was %d)\n",
+			"looking for interval at different criticality mode %u (was %u)\n",
 			scm, tinfo->criticality_mode);
 		gtd_reservation_find_interval(tinfo->gtdres, scm, now,
 					      &tinfo->gtdinterval,
@@ -307,7 +279,7 @@ static lt_t task_scheduling_decision(struct task_struct *tsk)
 
 	TRACE_TASK(
 		tsk,
-		"has computed new interval [%llu-%llu] (cpu %d) (mode %d) (is_inside_interval:%d)\n",
+		"has computed new interval [%llu-%llu] (cpu %u) (mode %u) (is_inside_interval:%u)\n",
 		start, end, tinfo->gtdinterval->cpu, tinfo->criticality_mode,
 		is_inside_interval);
 	// Check the next CPU to use, or NO_CPU
@@ -319,21 +291,21 @@ static lt_t task_scheduling_decision(struct task_struct *tsk)
 	state = cpu_state_for(previous_cpu);
 	raw_spin_lock(&state->lock);
 	if (next_cpu == previous_cpu) {
-		TRACE_TASK(tsk, "requesting scheduling on same CPU %d\n",
+		TRACE_TASK(tsk, "requesting scheduling on same CPU %u\n",
 			   previous_cpu);
 		state->linked = tsk;
 		if (state->scheduled != tsk) {
 			TRACE_TASK(
 				tsk,
-				"reschedule operation requested for CPU %d\n",
+				"reschedule operation requested for CPU %u\n",
 				previous_cpu);
 			litmus_reschedule(previous_cpu);
 		}
 	} else if (state->linked == tsk) {
-		TRACE_TASK(tsk, "requesting descheduling from CPU %d\n",
+		TRACE_TASK(tsk, "requesting descheduling from CPU %u\n",
 			   previous_cpu);
 		state->linked = NULL;
-		TRACE_TASK(tsk, "reschedule operation requested for CPU %d\n",
+		TRACE_TASK(tsk, "reschedule operation requested for CPU %u\n",
 			   previous_cpu);
 		litmus_reschedule(previous_cpu);
 	}
@@ -352,13 +324,13 @@ static lt_t task_scheduling_decision(struct task_struct *tsk)
 		// anyway and the current task will be scheduled spontaneously once
 		// state->linked is set and the lock is released.
 		needs_reschedule = !(state->scheduled && !state->linked);
-		TRACE_TASK(tsk, "requesting scheduling on new CPU %d\n",
+		TRACE_TASK(tsk, "requesting scheduling on new CPU %u\n",
 			   next_cpu);
 		state->linked = tsk;
 		if (needs_reschedule) {
 			TRACE_TASK(
 				tsk,
-				"reschedule operation requested for CPU %d\n",
+				"reschedule operation requested for CPU %u\n",
 				next_cpu);
 			litmus_reschedule(next_cpu);
 		}
@@ -384,6 +356,7 @@ static enum hrtimer_restart on_event_timer(struct hrtimer *timer)
 	struct gmcres_task_state *tinfo =
 		container_of(timer, struct gmcres_task_state, event_timer);
 	struct task_struct *tsk = tinfo->gtdres->task;
+	unsigned int min_criticality_mode = 0;
 	lt_t next_timer;
 
 	// hrtimer handlers are called from a IRQ handler, so IRQ are already disabled
@@ -394,10 +367,20 @@ static enum hrtimer_restart on_event_timer(struct hrtimer *timer)
 			   tinfo->major_cycle_start + tinfo->gtdinterval->end);
 	else
 		TRACE_TASK(tsk, "on timer with no interval");
-	next_timer = task_scheduling_decision(tsk);
-	TRACE_TASK(tsk, "next timer expiration set to %llu\n", next_timer);
-	hrtimer_set_expires(timer, ns_to_ktime(next_timer));
+	next_timer = task_scheduling_decision(tsk, &min_criticality_mode);
 	raw_spin_unlock(&tinfo->lock);
+
+	if (min_criticality_mode > system_criticality_mode()) {
+		TRACE_TASK(tsk, "will increase the criticality mode to %u\n",
+			   min_criticality_mode);
+		ensure_minimum_criticality_state(
+			criticality_state(litmus_clock(), min_criticality_mode),
+			tsk);
+	} else {
+		TRACE_TASK(tsk, "next timer expiration set to %llu\n",
+			   next_timer);
+		hrtimer_set_expires(timer, ns_to_ktime(next_timer));
+	}
 
 	return HRTIMER_RESTART;
 }
@@ -410,12 +393,22 @@ static enum hrtimer_restart on_event_timer(struct hrtimer *timer)
 // When this function is called, no gmcres_task_state or gmcres_cpu_state locks must be
 // held, as both will be taken during the rescheduling decisions if the mode actually
 // changes.
-static bool ensure_minimum_criticality_state(uint64_t target_state)
+// Concerning the task originating_task, it is assumed that its timer entry is locked
+// since this function is called from the timer handler. Therefore, only its expiration
+// date is set, the timer will be restarted by the caller.
+static bool
+ensure_minimum_criticality_state(uint64_t target_state,
+				 struct task_struct *originating_task)
 {
 	struct gtd_reservation *gtdres;
 	unsigned int target_mode = criticality_mode(target_state);
 	uint64_t current_state;
 	unsigned long flags;
+
+	if (target_mode > atomic_read(&maximum_criticality_level)) {
+		TRACE("ignoring request to switch to too high criticality mode %u\n",
+		      target_mode);
+	}
 
 	atomic_inc_return_acquire(&access_counter);
 
@@ -447,10 +440,14 @@ static bool ensure_minimum_criticality_state(uint64_t target_state)
 			// Make the task compute its next iteration time at either the
 			// current criticality mode if appropriate, or at criticality
 			// mode 0 at the next major cycle.
-			next_timer = task_scheduling_decision(tsk);
-			hrtimer_start(&tinfo->event_timer,
-				      ns_to_ktime(next_timer),
-				      HRTIMER_MODE_ABS);
+			next_timer = task_scheduling_decision(tsk, NULL);
+			if (tsk == originating_task)
+				hrtimer_set_expires(&tinfo->event_timer,
+						    ns_to_ktime(next_timer));
+			else
+				hrtimer_start(&tinfo->event_timer,
+					      ns_to_ktime(next_timer),
+					      HRTIMER_MODE_ABS);
 			TRACE_TASK(tsk, "timer reset to %llu\n", next_timer);
 			raw_spin_unlock(&tinfo->lock);
 		}
@@ -466,6 +463,7 @@ static bool ensure_minimum_criticality_state(uint64_t target_state)
 static struct task_struct *gmcres_schedule(struct task_struct *prev)
 {
 	struct gmcres_cpu_state *state = local_cpu_state();
+	uint64_t scs;
 	lt_t now;
 
 	raw_spin_lock(&state->lock);
@@ -477,33 +475,23 @@ static struct task_struct *gmcres_schedule(struct task_struct *prev)
 	state->prev_was_realtime = prev && is_realtime(prev);
 	WARN_ON(state->scheduled && !state->prev_was_realtime);
 
-	// Restart here if a mode change happens during the scheduling.
-restart:
-
-	// Check if we need to execute a requested criticality mode change.
-	// We do this in a loop because as we unlock the state in order to
-	// execute a mode change request another mode change request at an
-	// upper level could come in as well.
-	while (state->criticality_state >
-	       atomic64_read(&system_criticality_state)) {
-		uint64_t lcs = state->criticality_state;
-		// Unlock the CPU state around the criticality mode change as requested
-		// by the function contract.
+	// Wait until no change is in progress and release the lock in the
+	// meantime as the CPU state might be modified during the mode change.
+	if (atomic_read(&access_counter)) {
+		TRACE("access counter is set, release the lock temporarily\n");
 		raw_spin_unlock(&state->lock);
-		TRACE("ensuring that criticality mode is at least %u\n",
-		      criticality_mode(lcs));
-		ensure_minimum_criticality_state(lcs);
-		// Wait for a concurrent mode change to be over
-		while (atomic_read_acquire(&access_counter))
-			;
-		// Relock the CPU state
+		// Restart here if a mode change happens during the scheduling,
+		// while the lock has been released.
+	restart:
+		TRACE("waiting for access counter to reset\n");
+		while (atomic_read(&access_counter))
+			cpu_relax();
 		raw_spin_lock(&state->lock);
+		TRACE("access counter has been reset\n");
 	}
-	state->criticality_state = atomic64_read(&system_criticality_state);
+	scs = atomic64_read(&system_criticality_state);
 
 	now = litmus_clock();
-	TRACE("scheduling with criticality mode %u\n",
-	      criticality_mode_at(state->criticality_state, now));
 
 	// Link the task we were asked to link
 	if (state->scheduled != state->linked) {
@@ -519,31 +507,25 @@ restart:
 
 	raw_spin_unlock(&state->lock);
 
-	if (atomic_read(&access_counter)) {
-		TRACE("access_counter is %d\n", atomic_read(&access_counter));
-	}
-
 	// Check if a system criticality mode change, or change in progress, has
 	// not made this scheduling decision obsolete already, and restart the
 	// process if it does. It is important that we do this once the CPU state lock
 	// has been released, because the mode change process might also spin on this
 	// CPU lock.
-	if (atomic64_read(&system_criticality_state) >
-		    state->criticality_state ||
+	if (atomic64_read(&system_criticality_state) > scs ||
 	    atomic_read(&access_counter)) {
-		TRACE("criticality mode increase detected while scheduling new task, "
+		TRACE("criticality mode change detected while scheduling new task, "
 		      "restarting decision\n");
-		raw_spin_lock(&state->lock);
 		goto restart;
 	}
 
 	if (state->scheduled)
 		TRACE_TASK(state->scheduled,
 			   "returning decision for criticality mode %u\n",
-			   criticality_mode_at(state->criticality_state, now));
+			   criticality_mode_at(scs, now));
 	else
 		TRACE("returning decision (nothing) for criticality mode %u\n",
-		      criticality_mode_at(state->criticality_state, now));
+		      criticality_mode_at(scs, now));
 	return state->scheduled;
 }
 
@@ -568,7 +550,7 @@ static long gmcres_admit_task(struct task_struct *tsk)
 	if (gtdres->major_cycle % period) {
 		LITMUS_TRACE_TASK(
 			tsk,
-			"period (%llu) is not an integral factor of the reservation %d "
+			"period (%llu) is not an integral factor of the reservation %u "
 			"major cycle (%llu)\n",
 			period, res_id, gtdres->major_cycle);
 		return -EINVAL;
@@ -710,7 +692,7 @@ static void gmcres_task_new(struct task_struct *tsk, int on_runqueue,
 	BUG_ON(!tinfo->gtdinterval);
 	TRACE_TASK(
 		tsk,
-		"registers interest for interval [%llu-%llu] (is_inside_interval:%d)\n",
+		"registers interest for interval [%llu-%llu] (is_inside_interval:%u)\n",
 		tinfo->major_cycle_start + tinfo->gtdinterval->start,
 		tinfo->major_cycle_start + tinfo->gtdinterval->end,
 		is_inside_interval);
@@ -721,7 +703,7 @@ static void gmcres_task_new(struct task_struct *tsk, int on_runqueue,
 		      HRTIMER_MODE_ABS);
 
 	TRACE_TASK(tsk,
-		   "is a new RT task at %llu (on runqueue:%d, running:%d)\n",
+		   "is a new RT task at %llu (on runqueue:%u, running:%u)\n",
 		   now, on_runqueue, is_running);
 
 	// Setup job parameters by aligning the release time to the next occurrence of the
@@ -751,7 +733,7 @@ static void gmcres_task_new(struct task_struct *tsk, int on_runqueue,
 			state->linked = tsk;
 		} else {
 			TRACE_TASK(tsk,
-				   "will ask to get descheduled from CPU %d\n",
+				   "will ask to get descheduled from CPU %u\n",
 				   current_cpu);
 			litmus_reschedule_local();
 		}
@@ -765,7 +747,7 @@ static void gmcres_task_new(struct task_struct *tsk, int on_runqueue,
 				cpu_state_for(wanted_cpu);
 			raw_spin_lock(&state->lock);
 			state->linked = tsk;
-			TRACE_TASK(tsk, "is requesting to run on CPU %d\n",
+			TRACE_TASK(tsk, "is requesting to run on CPU %u\n",
 				   wanted_cpu);
 			raw_spin_unlock(&state->lock);
 			litmus_reschedule(wanted_cpu);
@@ -814,14 +796,14 @@ static void gmcres_task_exit(struct task_struct *tsk)
 		if (state->scheduled == tsk) {
 			TRACE_TASK(
 				tsk,
-				"has been forcefully descheduled from CPU %d\n",
+				"has been forcefully descheduled from CPU %u\n",
 				cpu);
 			state->scheduled = NULL;
 		}
 		if (state->linked == tsk) {
 			TRACE_TASK(
 				tsk,
-				"has been forcefully derequested from CPU %d\n",
+				"has been forcefully derequested from CPU %u\n",
 				cpu);
 			state->linked = NULL;
 		}
@@ -849,7 +831,7 @@ static long gmcres_reservation_create(int res_type, void *__user _config)
 		return -EFAULT;
 
 	if (config.cpu < 0 || !cpu_online(config.cpu)) {
-		TRACE("Invalid reservation (%u): CPU %d offline\n", config.id,
+		TRACE("Invalid reservation (%u): CPU %u offline\n", config.id,
 		      config.cpu);
 		return -EINVAL;
 	}
@@ -878,7 +860,7 @@ static long gmcres_reservation_create(int res_type, void *__user _config)
 			goto error_with_unlock;
 		}
 		if (interval.end / gtdres->major_cycle >= 1 << CRIT_MODE_BITS) {
-			TRACE("Cannot add interval [%llu-%llu] on CPU %d because it exceeds "
+			TRACE("Cannot add interval [%llu-%llu] on CPU %u because it exceeds "
 			      "the greatest allowed number of criticality levels (%u)\n",
 			      interval.start, interval.end, config.cpu,
 			      (1 << CRIT_MODE_BITS) - 1);
@@ -888,7 +870,7 @@ static long gmcres_reservation_create(int res_type, void *__user _config)
 		ret = gtd_reservation_add_interval(gtdres, interval.start,
 						   interval.end, config.cpu);
 		if (ret < 0) {
-			TRACE("Cannot add interval [%llu-%llu] on CPU %d\n",
+			TRACE("Cannot add interval [%llu-%llu] on CPU %u\n",
 			      interval.start, interval.end, config.cpu);
 			goto error_with_unlock;
 		}
@@ -905,7 +887,7 @@ error_with_unlock:
 static bool gmcres_post_migration_validate(struct task_struct *next)
 {
 	struct gmcres_cpu_state *state = local_cpu_state();
-	TRACE_TASK(next, "has arrived on CPU %d\n", state->cpu);
+	TRACE_TASK(next, "has arrived on CPU %u\n", state->cpu);
 	return 1;
 }
 
@@ -925,7 +907,7 @@ static bool gmcres_should_wait_for_stack(struct task_struct *next)
 		raw_spin_unlock_irqrestore(&state->lock, flags);
 		TRACE_TASK(
 			next,
-			"should no longer scheduled on CPU %d anyway, giving up\n",
+			"should no longer scheduled on CPU %u anyway, giving up\n",
 			state->cpu);
 		return false;
 	} else if (state->prev_was_realtime) {
@@ -979,7 +961,7 @@ static void gmcres_task_block(struct task_struct *tsk)
 		if (current_cpu != expected_cpu) {
 			TRACE_TASK(
 				tsk,
-				"must be unscheduled/unrequested from CPU %d\n",
+				"must be unscheduled/unrequested from CPU %u\n",
 				expected_cpu);
 			state = cpu_state_for(expected_cpu);
 			raw_spin_lock(&state->lock);
@@ -1017,7 +999,7 @@ static void gmcres_task_wake_up(struct task_struct *tsk)
 	// If another CPU than the current one is expected, mark the task as requested
 	// and provoke a reschedule at both places.
 	if (expected_cpu != NO_CPU) {
-		TRACE_TASK(tsk, "is requesting to be scheduled on CPU %d\n",
+		TRACE_TASK(tsk, "is requesting to be scheduled on CPU %u\n",
 			   expected_cpu);
 		state = cpu_state_for(expected_cpu);
 		raw_spin_lock(&state->lock);
@@ -1077,7 +1059,7 @@ static long gmcres_activate_plugin(void)
 	gtd_env_init(&gtdenv);
 
 	for_each_online_cpu (cpu) {
-		TRACE("Initializing CPU%d...\n", cpu);
+		TRACE("Initializing CPU%u...\n", cpu);
 
 		state = cpu_state_for(cpu);
 		memset(state, 0, sizeof(*state));
@@ -1145,7 +1127,7 @@ long gmcres_complete_job(void)
 		if (state->linked == current)
 			state->linked = NULL;
 		raw_spin_unlock(&state->lock);
-		TRACE_TASK(current, "will ask CPU %d to deschedule it\n",
+		TRACE_TASK(current, "will ask CPU %u to deschedule it\n",
 			   state->cpu);
 		litmus_reschedule_local();
 		tsk_rt(current)->completed = 1;
