@@ -29,6 +29,11 @@
 // 2^10 = 1024 criticality levels
 #define CRIT_MODE_BITS 10
 
+// Define TIMING_TRACES to generate additional timing traces in order
+// to analyze performances. Some accesses to lt_t fields may be done outside
+// proper locks, but this only affects tracing.
+#define TIMING_TRACES
+
 static struct gtd_env gtdenv;
 
 struct gmcres_cpu_state {
@@ -46,6 +51,14 @@ struct gmcres_cpu_state {
 
 	// Task interested in being scheduled
 	struct task_struct *linked;
+
+#ifdef TIMING_TRACES
+	// Local reschedule request on the same CPU, or 0 if none
+	lt_t reschedule_date;
+
+	// With migration reschedule request on this CPU, or 0 if none
+	lt_t migration_reschedule_date;
+#endif // TIMING_TRACES
 };
 
 static DEFINE_PER_CPU(struct gmcres_cpu_state, gmcres_cpu_state);
@@ -94,6 +107,11 @@ static atomic_t maximum_criticality_level;
 // The current major cycle of executing tasks. Never zero, but only meaningful
 // when at least one task has entered the system.
 static lt_t system_major_cycle;
+
+#ifdef TIMING_TRACES
+static lt_t mode_change_event_date;
+static atomic_t mode_change_rescheduling_cpus;
+#endif // TIMING_TRACES
 
 // Return the criticality mode contained in a criticality state without concern
 // for the generation.
@@ -299,6 +317,11 @@ static lt_t task_scheduling_decision(struct task_struct *tsk,
 				tsk,
 				"reschedule operation requested for CPU %u\n",
 				previous_cpu);
+#ifdef TIMING_TRACES
+			atomic_or(1 << previous_cpu,
+				  &mode_change_rescheduling_cpus);
+			WRITE_ONCE(state->reschedule_date, now);
+#endif // TIMING_TRACES
 			litmus_reschedule(previous_cpu);
 		}
 	} else if (state->linked == tsk) {
@@ -307,6 +330,9 @@ static lt_t task_scheduling_decision(struct task_struct *tsk,
 		state->linked = NULL;
 		TRACE_TASK(tsk, "reschedule operation requested for CPU %u\n",
 			   previous_cpu);
+#ifdef TIMING_TRACES
+		atomic_or(1 << previous_cpu, &mode_change_rescheduling_cpus);
+#endif // TIMING_TRACES
 		litmus_reschedule(previous_cpu);
 	}
 	// If we have state->linked != tsk and state->scheduled == tsk,
@@ -332,6 +358,11 @@ static lt_t task_scheduling_decision(struct task_struct *tsk,
 				tsk,
 				"reschedule operation requested for CPU %u\n",
 				next_cpu);
+#ifdef TIMING_TRACES
+			WRITE_ONCE(state->migration_reschedule_date, now);
+			atomic_or(1 << next_cpu,
+				  &mode_change_rescheduling_cpus);
+#endif // TIMING_TRACES
 			litmus_reschedule(next_cpu);
 		}
 		raw_spin_unlock(&state->lock);
@@ -358,14 +389,27 @@ static enum hrtimer_restart on_event_timer(struct hrtimer *timer)
 	struct task_struct *tsk = tinfo->gtdres->task;
 	unsigned int min_criticality_mode = 0;
 	lt_t next_timer;
+#ifdef TIMING_TRACES
+	lt_t theoretical_event_date = 0;
+	lt_t tfe_lag = 0;
+#endif // TIMING_TRACES
 
 	// hrtimer handlers are called from a IRQ handler, so IRQ are already disabled
 	raw_spin_lock(&tinfo->lock);
-	if (tinfo->gtdinterval)
+	if (tinfo->gtdinterval) {
+#ifdef TIMING_TRACES
+		theoretical_event_date =
+			tinfo->major_cycle_start +
+			(litmus_clock() >= tinfo->major_cycle_start +
+						   tinfo->gtdinterval->end ?
+				       tinfo->gtdinterval->end :
+				       tinfo->gtdinterval->start);
+		tfe_lag = litmus_clock() - theoretical_event_date;
+#endif // TIMING_TRACES
 		TRACE_TASK(tsk, "on timer with interval [%llu-%llu]\n",
 			   tinfo->major_cycle_start + tinfo->gtdinterval->start,
 			   tinfo->major_cycle_start + tinfo->gtdinterval->end);
-	else
+	} else
 		TRACE_TASK(tsk, "on timer with no interval");
 	next_timer = task_scheduling_decision(tsk, &min_criticality_mode);
 	raw_spin_unlock(&tinfo->lock);
@@ -373,6 +417,11 @@ static enum hrtimer_restart on_event_timer(struct hrtimer *timer)
 	if (min_criticality_mode > system_criticality_mode()) {
 		TRACE_TASK(tsk, "will increase the criticality mode to %u\n",
 			   min_criticality_mode);
+#ifdef TIMING_TRACES
+		mode_change_event_date = theoretical_event_date;
+		if (tfe_lag)
+			TRACE_TASK(tsk, "TFE lag is %llu ns\n", tfe_lag);
+#endif // TIMING_TRACES
 		ensure_minimum_criticality_state(
 			criticality_state(litmus_clock(), min_criticality_mode),
 			tsk);
@@ -404,6 +453,9 @@ ensure_minimum_criticality_state(uint64_t target_state,
 	unsigned int target_mode = criticality_mode(target_state);
 	uint64_t current_state;
 	unsigned long flags;
+#ifdef TIMING_TRACES
+	lt_t emcs_entry = litmus_clock();
+#endif // TIMING_TRACES
 
 	if (target_mode > atomic_read(&maximum_criticality_level)) {
 		TRACE("ignoring request to switch to too high criticality mode %u\n",
@@ -457,6 +509,10 @@ ensure_minimum_criticality_state(uint64_t target_state,
 	TRACE("criticality mode switch done\n");
 
 	atomic_dec_return_release(&access_counter);
+#ifdef TIMING_TRACES
+	TRACE("tables recomputation done in %llu ns\n",
+	      litmus_clock() - emcs_entry);
+#endif // TIMING_TRACES
 	return true;
 }
 
@@ -465,6 +521,9 @@ static struct task_struct *gmcres_schedule(struct task_struct *prev)
 	struct gmcres_cpu_state *state = local_cpu_state();
 	uint64_t scs;
 	lt_t now;
+#ifdef TIMING_TRACES
+	lt_t schedule_entry = litmus_clock();
+#endif // TIMING_TRACES
 
 	raw_spin_lock(&state->lock);
 
@@ -478,17 +537,32 @@ static struct task_struct *gmcres_schedule(struct task_struct *prev)
 	// Wait until no change is in progress and release the lock in the
 	// meantime as the CPU state might be modified during the mode change.
 	if (atomic_read(&access_counter)) {
+#ifdef TIMING_TRACES
+		lt_t spin_entry;
+#endif // TIMING_TRACES
 		TRACE("access counter is set, release the lock temporarily\n");
 		raw_spin_unlock(&state->lock);
 		// Restart here if a mode change happens during the scheduling,
 		// while the lock has been released.
 	restart:
+#ifdef TIMING_TRACES
+		spin_entry = litmus_clock();
+#endif // TIMING_TRACES
 		TRACE("waiting for access counter to reset\n");
 		while (atomic_read(&access_counter))
 			cpu_relax();
+#ifdef TIMING_TRACES
+		if (state->linked || state->scheduled)
+			TRACE("blocked on access_counter for %llu ns\n",
+			      litmus_clock() - spin_entry);
+#endif // TIMING_TRACES
 		raw_spin_lock(&state->lock);
 		TRACE("access counter has been reset\n");
 	}
+#ifdef TIMING_TRACES
+	else if (state->linked || state->scheduled)
+		TRACE("blocked on access_counter for 0 ns\n");
+#endif // TIMING_TRACES
 	scs = atomic64_read(&system_criticality_state);
 
 	now = litmus_clock();
@@ -519,13 +593,48 @@ static struct task_struct *gmcres_schedule(struct task_struct *prev)
 		goto restart;
 	}
 
-	if (state->scheduled)
+	if (state->scheduled) {
+#ifdef TIMING_TRACES
+		lt_t reschedule_date = READ_ONCE(state->reschedule_date);
+		lt_t migration_reschedule_date =
+			READ_ONCE(state->migration_reschedule_date);
+		lt_t now = litmus_clock();
+		if (reschedule_date && reschedule_date < now &&
+		    !migration_reschedule_date) {
+			TRACE_TASK(state->scheduled,
+				   "has been scheduled in %llu ns\n",
+				   now - reschedule_date);
+			WRITE_ONCE(state->reschedule_date, 0);
+		} else if (migration_reschedule_date &&
+			   migration_reschedule_date < now &&
+			   !reschedule_date) {
+			WRITE_ONCE(state->reschedule_date, now);
+			TRACE_TASK(
+				state->scheduled,
+				"has been scheduled but not migrated in %llu ns\n",
+				now - migration_reschedule_date);
+		}
+		TRACE("gmcres_schedule took %llu ns\n",
+		      litmus_clock() - schedule_entry);
+#endif // TIMING_TRACES
 		TRACE_TASK(state->scheduled,
 			   "returning decision for criticality mode %u\n",
 			   criticality_mode_at(scs, now));
-	else
+	} else
 		TRACE("returning decision (nothing) for criticality mode %u\n",
 		      criticality_mode_at(scs, now));
+#ifdef TIMING_TRACES
+	if (atomic_read(&mode_change_rescheduling_cpus) & (1 << state->cpu)) {
+		lt_t event_date = mode_change_event_date;
+		atomic_andnot(1 << state->cpu, &mode_change_rescheduling_cpus);
+		if (!atomic_read(&mode_change_rescheduling_cpus) &&
+		    event_date) {
+			mode_change_event_date = 0;
+			TRACE("total mode change in %llu ns\n",
+			      litmus_clock() - event_date);
+		}
+	}
+#endif // TIMING_TRACES
 	return state->scheduled;
 }
 
@@ -747,6 +856,9 @@ static void gmcres_task_new(struct task_struct *tsk, int on_runqueue,
 				cpu_state_for(wanted_cpu);
 			raw_spin_lock(&state->lock);
 			state->linked = tsk;
+#ifdef TIMING_TRACES
+			WRITE_ONCE(state->reschedule_date, litmus_clock());
+#endif // TIMING_TRACES
 			TRACE_TASK(tsk, "is requesting to run on CPU %u\n",
 				   wanted_cpu);
 			raw_spin_unlock(&state->lock);
@@ -887,6 +999,21 @@ error_with_unlock:
 static bool gmcres_post_migration_validate(struct task_struct *next)
 {
 	struct gmcres_cpu_state *state = local_cpu_state();
+#ifdef TIMING_TRACES
+	lt_t migration_reschedule_date =
+		READ_ONCE(state->migration_reschedule_date);
+	lt_t reschedule_date = READ_ONCE(state->reschedule_date);
+	lt_t now;
+	if (migration_reschedule_date &&
+	    migration_reschedule_date < (now = litmus_clock())) {
+		TRACE_TASK(state->scheduled,
+			   "has been scheduled in %llu ns (%llu ns wait)\n",
+			   now - migration_reschedule_date,
+			   now - reschedule_date);
+		WRITE_ONCE(state->migration_reschedule_date, 0);
+		WRITE_ONCE(state->reschedule_date, 0);
+	}
+#endif // TIMING_TRACES
 	TRACE_TASK(next, "has arrived on CPU %u\n", state->cpu);
 	return 1;
 }
@@ -1004,6 +1131,9 @@ static void gmcres_task_wake_up(struct task_struct *tsk)
 		state = cpu_state_for(expected_cpu);
 		raw_spin_lock(&state->lock);
 		state->linked = tsk;
+#ifdef TIMING_TRACES
+		state->reschedule_date = litmus_clock();
+#endif // TIMING_TRACES
 		raw_spin_unlock(&state->lock);
 		litmus_reschedule_local();
 		litmus_reschedule(expected_cpu);
